@@ -5,7 +5,7 @@ import subprocess
 import sys
 
 
-REPO_ROOT = pathlib.Path("/Users/settoramediku/Documents/Github/kofi-ska/swe-projects/blockchain/sol/blockchain-transaction-calc-main/v1")
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 COMPOSE_DIR = REPO_ROOT / "prod" / "deploy"
 
 

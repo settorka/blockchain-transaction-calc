@@ -66,7 +66,7 @@ final class RequestWorkflowSpec extends AsyncFlatSpec with Matchers {
       result.actionability shouldBe Actionability.Actionable
       result.decisionId shouldBe "decision-1"
       Option(repository.state.get("req-1")).get.terminalState shouldBe TerminalState.Accept
-      Option(cache.state.get("req-1")).get shouldBe "decision-1"
+      Option(cache.state.get("dedupe-1")).get shouldBe "decision-1"
       audit.events.size shouldBe 1
       audit.events.head.stage shouldBe "terminal"
       audit.events.head.success shouldBe true
@@ -99,7 +99,8 @@ final class RequestWorkflowSpec extends AsyncFlatSpec with Matchers {
     )
 
     repository.state.put("req-1", cached)
-    cache.state.put("req-1", "decision-1")
+    repository.dedupe.put("dedupe-1", "req-1")
+    cache.state.put("dedupe-1", "decision-1")
 
     workflow.process(context()).map { result =>
       result shouldBe cached
@@ -116,13 +117,47 @@ final class RequestWorkflowSpec extends AsyncFlatSpec with Matchers {
     val audit = new RecordingAuditPublisher
     val workflow = new RequestWorkflow(new FailingGateway, repository, cache, audit, dedupeTtlSeconds = 3600)
 
-    cache.state.put("req-1", "decision-1")
+    cache.state.put("dedupe-1", "decision-1")
 
     workflow.process(context()).map { result =>
       result.terminalState shouldBe TerminalState.Failed
       result.reasonCode shouldBe "DUPLICATE_INFLIGHT_REQUEST"
       repository.state.get("req-1") shouldBe null
       audit.events shouldBe empty
+      succeed
+    }
+  }
+
+  it should "replay by dedupe key when the request id changes" in {
+    val repository = new InMemoryDecisionRepository
+    val cache = new InMemoryDedupeCache
+    val audit = new RecordingAuditPublisher
+    val gateway = new CountingGateway
+    val workflow = new RequestWorkflow(gateway, repository, cache, audit, dedupeTtlSeconds = 3600)
+
+    val first = context()
+    val second = context().copy(requestId = "req-2")
+
+    workflow.process(first).flatMap { original =>
+      workflow.process(second).map { replayed =>
+        original.requestId shouldBe "req-1"
+        replayed.requestId shouldBe "req-1"
+        gateway.count shouldBe 1
+        audit.events.exists(_.stage == "replay") shouldBe true
+        succeed
+      }
+    }
+  }
+
+  it should "fail closed when compute returns a mismatched request id" in {
+    val repository = new InMemoryDecisionRepository
+    val cache = new InMemoryDedupeCache
+    val audit = new RecordingAuditPublisher
+    val workflow = new RequestWorkflow(new MismatchedGateway, repository, cache, audit, dedupeTtlSeconds = 3600)
+
+    workflow.process(context()).map { result =>
+      result.terminalState shouldBe TerminalState.Failed
+      result.reasonCode shouldBe "COMPUTE_RESPONSE_REQUEST_ID_MISMATCH"
       succeed
     }
   }
@@ -137,19 +172,38 @@ final class RequestWorkflowSpec extends AsyncFlatSpec with Matchers {
       Future.failed(new IllegalStateException("compute should not run"))
   }
 
+  private final class CountingGateway extends ComputeGateway {
+    @volatile var count = 0
+    override def evaluate(request: RequestContext): Future[EvaluateSwapResponse] = {
+      count += 1
+      Future.successful(acceptResponse(request.requestId))
+    }
+  }
+
+  private final class MismatchedGateway extends ComputeGateway {
+    override def evaluate(request: RequestContext): Future[EvaluateSwapResponse] =
+      Future.successful(acceptResponse("wrong-request"))
+  }
+
   private final class InMemoryDecisionRepository extends DecisionRepository {
     val state = new ConcurrentHashMap[String, DecisionResult]()
+    val dedupe = new ConcurrentHashMap[String, String]()
     val audit = TrieMap.empty[(String, String), TransitionEvent]
     val published = TrieMap.empty[(String, String), Boolean]
 
     override def find(requestId: String): Future[Option[DecisionResult]] =
       Future.successful(Option(state.get(requestId)))
 
-    override def upsert(ctx: RequestContext, result: DecisionResult, event: TransitionEvent): Future[Unit] =
+    override def findByDedupeKey(dedupeKey: String): Future[Option[DecisionResult]] =
+      Future.successful(Option(dedupe.get(dedupeKey)).flatMap(id => Option(state.get(id))))
+
+    override def upsert(ctx: RequestContext, result: DecisionResult, event: TransitionEvent): Future[DecisionResult] =
       Future.successful {
-        state.putIfAbsent(ctx.requestId, result)
-        audit.putIfAbsent((ctx.requestId, result.decisionId), event)
-        ()
+        val durableRequestId = Option(dedupe.putIfAbsent(ctx.dedupeKey, ctx.requestId)).getOrElse(ctx.requestId)
+        val durable = Option(state.putIfAbsent(durableRequestId, result.copy(requestId = durableRequestId)))
+          .getOrElse(state.get(durableRequestId))
+        audit.putIfAbsent((durable.requestId, durable.decisionId), event.copy(requestId = durable.requestId, decisionId = durable.decisionId))
+        durable
       }
 
     override def pendingAudit(limit: Int): Future[Vector[TransitionEvent]] =

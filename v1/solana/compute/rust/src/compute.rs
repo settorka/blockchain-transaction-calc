@@ -1,12 +1,12 @@
 use crate::breakeven;
-use crate::ev;
 use crate::error::ComputeError;
+use crate::ev;
 use crate::fee;
 use crate::freshness;
 use crate::risk;
 use crate::route_scoring::{self, RouteScore};
-use crate::source_truth::{self, SourceTruthState};
 use crate::slippage;
+use crate::source_truth::{self, SourceTruthState};
 use crate::types::{ComputeRequest, ComputeResponse, ComputeRouteCandidate};
 
 use std::time::Instant;
@@ -194,9 +194,19 @@ fn economics(request: &ComputeRequest, route: &RouteScore) -> Economics {
     let fee_cost = fee::fee_cost(request.amount_in, route.hop_count);
     let slippage_cost = slippage::slippage_cost(expected_output, route.hop_count);
     let risk_score = risk::risk_score(route.hop_count, &route.venue);
-    let breakeven_margin = breakeven::margin(expected_output, request.amount_in, fee_cost, slippage_cost);
-    let ev_estimate = ev::estimate(expected_output, request.amount_in, fee_cost, slippage_cost, risk_score);
-    let ev_lower_bound = ev::lower_bound(ev_estimate, uncertainty_margin(request.quote_age, risk_score));
+    let breakeven_margin =
+        breakeven::margin(expected_output, request.amount_in, fee_cost, slippage_cost);
+    let ev_estimate = ev::estimate(
+        expected_output,
+        request.amount_in,
+        fee_cost,
+        slippage_cost,
+        risk_score,
+    );
+    let ev_lower_bound = ev::lower_bound(
+        ev_estimate,
+        uncertainty_margin(request.quote_age, risk_score),
+    );
 
     Economics {
         expected_output,

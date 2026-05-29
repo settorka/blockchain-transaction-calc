@@ -50,7 +50,7 @@ impl TryFrom<EvaluateSwapRequest> for ComputeRequest {
     type Error = ComputeError;
 
     fn try_from(value: EvaluateSwapRequest) -> Result<Self, Self::Error> {
-        let amount_in = value.amount_in.parse::<f64>().map_err(|_| ComputeError::InvalidRequest)?;
+        let amount_in = parse_amount(&value.amount_in)?;
         let mut route_candidates = Vec::with_capacity(value.route_candidates.len());
         for candidate in value.route_candidates {
             route_candidates.push(ComputeRouteCandidate {
@@ -68,7 +68,11 @@ impl TryFrom<EvaluateSwapRequest> for ComputeRequest {
             token_in: value.token_in,
             token_out: value.token_out,
             amount_in,
-            route_id: if value.route_id.is_empty() { None } else { Some(value.route_id) },
+            route_id: if value.route_id.is_empty() {
+                None
+            } else {
+                Some(value.route_id)
+            },
             slot: value.slot,
             quote_age: value.quote_age,
             source_hashes: value.source_hashes,
@@ -112,5 +116,22 @@ impl From<ComputeResponse> for EvaluateSwapResponse {
 }
 
 fn format_amount(value: f64) -> String {
-    format!("{value:.6}")
+    format!("{value:.12}")
+}
+
+fn parse_amount(value: &str) -> Result<f64, ComputeError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.contains('e') || trimmed.contains('E') {
+        return Err(ComputeError::InvalidRequest);
+    }
+    let decimal_places = trimmed
+        .split_once('.')
+        .map(|(_, fraction)| fraction.len())
+        .unwrap_or(0);
+    if decimal_places > 12 {
+        return Err(ComputeError::InvalidRequest);
+    }
+    trimmed
+        .parse::<f64>()
+        .map_err(|_| ComputeError::InvalidRequest)
 }

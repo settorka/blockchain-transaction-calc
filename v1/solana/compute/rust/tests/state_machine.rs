@@ -1,8 +1,8 @@
 use solana_compute::compute;
+use solana_compute::error::ComputeError;
 use solana_compute::freshness;
 use solana_compute::proto::solana::v1::compute_service_server::ComputeService;
 use solana_compute::proto::solana::v1::{Actionability, EvaluateSwapRequest, TerminalState};
-use solana_compute::error::ComputeError;
 use solana_compute::route_scoring;
 use solana_compute::service::ComputeServiceImpl;
 use solana_compute::source_truth::{self, SourceTruthState};
@@ -150,6 +150,37 @@ async fn grpc_service_matches_compute_engine() {
     assert_eq!(response.terminal_state, TerminalState::Accept as i32);
     assert_eq!(response.actionability, Actionability::Actionable as i32);
     assert_eq!(response.request_id, "req-2");
+}
+
+#[tokio::test]
+async fn grpc_rejects_exponent_amounts_before_compute() {
+    let mut request = EvaluateSwapRequest {
+        request_id: "req-exp".to_string(),
+        dedupe_key: "dedupe-exp".to_string(),
+        trace_id: "trace-exp".to_string(),
+        model_version: "v1".to_string(),
+        token_in: "USDC".to_string(),
+        token_out: "SOL".to_string(),
+        amount_in: "1e9".to_string(),
+        route_id: "route-a".to_string(),
+        slot: 100,
+        quote_age: 1,
+        source_hashes: vec!["hash-a".to_string(), "hash-b".to_string()],
+        route_candidates: vec![],
+    };
+    let service = ComputeServiceImpl::default();
+    let error = service
+        .evaluate_swap(Request::new(request.clone()))
+        .await
+        .expect_err("exponent amount rejected");
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+
+    request.amount_in = "1.0000000000001".to_string();
+    let error = service
+        .evaluate_swap(Request::new(request))
+        .await
+        .expect_err("over-precision amount rejected");
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
 }
 
 #[test]

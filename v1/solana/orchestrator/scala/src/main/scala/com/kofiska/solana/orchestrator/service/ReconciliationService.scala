@@ -14,20 +14,21 @@ final class ReconciliationService(
   def runOnce(limit: Int): Future[ReconciliationReport] =
     for {
       pending <- decisionRepository.pendingAudit(limit)
-      auditRepublished <- publishPendingAudit(pending)
+      audit <- publishPendingAudit(pending)
       dedupeDrift <- repairDedupe(limit)
     } yield ReconciliationReport(
       pendingAuditCount = pending.size,
-      republishedAuditCount = auditRepublished,
+      republishedAuditCount = audit._1,
+      auditPublishFailureCount = audit._2,
       dedupeRepairedCount = dedupeDrift
     )
 
-  private def publishPendingAudit(events: Vector[com.kofiska.solana.orchestrator.domain.TransitionEvent]): Future[Int] =
-    events.foldLeft(Future.successful(0)) { (acc, event) =>
-      acc.flatMap { count =>
+  private def publishPendingAudit(events: Vector[com.kofiska.solana.orchestrator.domain.TransitionEvent]): Future[(Int, Int)] =
+    events.foldLeft(Future.successful((0, 0))) { (acc, event) =>
+      acc.flatMap { case (published, failed) =>
         auditPublisher.publish(event).flatMap { _ =>
-          decisionRepository.markAuditPublished(event.requestId, event.decisionId).map(_ => count + 1)
-        }.recover { case _ => count }
+          decisionRepository.markAuditPublished(event.requestId, event.decisionId).map(_ => (published + 1, failed))
+        }.recover { case _ => (published, failed + 1) }
       }
     }
 
@@ -36,12 +37,12 @@ final class ReconciliationService(
       keys <- dedupeCache.scan("solana:dedupe:", limit)
       repaired <- keys.foldLeft(Future.successful(0)) { (acc, key) =>
         acc.flatMap { count =>
-          val requestId = key.stripPrefix("solana:dedupe:")
-          decisionRepository.find(requestId).flatMap {
+          val dedupeKey = key.stripPrefix("solana:dedupe:")
+          decisionRepository.findByDedupeKey(dedupeKey).flatMap {
             case Some(result) =>
-              dedupeCache.put(requestId, result.decisionId, dedupeTtlSeconds).map(_ => count + 1)
+              dedupeCache.put(dedupeKey, result.decisionId, dedupeTtlSeconds).map(_ => count + 1)
             case None =>
-              dedupeCache.delete(requestId).map(_ => count)
+              dedupeCache.delete(dedupeKey).map(_ => count)
           }
         }
       }
@@ -51,5 +52,6 @@ final class ReconciliationService(
 final case class ReconciliationReport(
   pendingAuditCount: Int,
   republishedAuditCount: Int,
+  auditPublishFailureCount: Int,
   dedupeRepairedCount: Int
 )
