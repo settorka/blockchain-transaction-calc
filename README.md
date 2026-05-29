@@ -214,5 +214,5 @@ v3 must close the loop between decision EV and settled Solana outcome. The syste
 
 - `v0`: local Scala arithmetic proof.
 - `v1`: bounded Scala/Rust/gRPC decision system with durable replay and audit.
-- `v2`: distributed Akka-led orchestration with independently scalable Rust compute, OTEL, Jaeger, SLI/SLO/SLA posture, and `1M ops/hour` operating target.
+- `v2`: distributed Akka-led orchestration with independently scalable Rust compute, OTEL, Jaeger, SLI/SLO/SLAs defined , and `1M ops/hour` operating target.
 - `v3`: Solana mainnet target with chain-aware execution, settlement, fee, routing, freshness, and realized-EV controls.
