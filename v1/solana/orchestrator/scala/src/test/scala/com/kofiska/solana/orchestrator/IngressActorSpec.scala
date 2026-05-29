@@ -33,6 +33,21 @@ final class IngressActorSpec extends ScalaTestWithActorTestKit with AnyWordSpecL
       repository.state.get("req-1").terminalState shouldBe TerminalState.Accept
       audit.events.head.stage shouldBe "terminal"
     }
+
+    "fail closed when the ingress limit is reached" in {
+      val repository = new InMemoryDecisionRepository
+      val cache = new InMemoryDedupeCache
+      val audit = new RecordingAuditPublisher
+      val workflow = new RequestWorkflow(new AcceptGateway, repository, cache, audit, dedupeTtlSeconds = 3600)
+      val ingress = spawn(IngressActor(workflow, maxInFlight = 0))
+      val replyTo = createTestProbe[DecisionResult]()
+
+      ingress ! IngressActor.Submit(requestContext(), replyTo.ref)
+
+      val result = replyTo.receiveMessage()
+      result.terminalState shouldBe TerminalState.Failed
+      result.reasonCode shouldBe "INGRESS_OVERLOADED"
+    }
   }
 
   private def requestContext(): RequestContext =
@@ -80,17 +95,23 @@ final class IngressActorSpec extends ScalaTestWithActorTestKit with AnyWordSpecL
 
   private final class InMemoryDecisionRepository extends DecisionRepository {
     val state = new ConcurrentHashMap[String, DecisionResult]()
+    val dedupe = new ConcurrentHashMap[String, String]()
     val audit = TrieMap.empty[(String, String), TransitionEvent]
     val published = TrieMap.empty[(String, String), Boolean]
 
     override def find(requestId: String): Future[Option[DecisionResult]] =
       Future.successful(Option(state.get(requestId)))
 
-    override def upsert(ctx: RequestContext, result: DecisionResult, event: TransitionEvent): Future[Unit] =
+    override def findByDedupeKey(dedupeKey: String): Future[Option[DecisionResult]] =
+      Future.successful(Option(dedupe.get(dedupeKey)).flatMap(id => Option(state.get(id))))
+
+    override def upsert(ctx: RequestContext, result: DecisionResult, event: TransitionEvent): Future[DecisionResult] =
       Future.successful {
-        state.putIfAbsent(ctx.requestId, result)
-        audit.putIfAbsent((ctx.requestId, result.decisionId), event)
-        ()
+        val durableRequestId = Option(dedupe.putIfAbsent(ctx.dedupeKey, ctx.requestId)).getOrElse(ctx.requestId)
+        val durable = Option(state.putIfAbsent(durableRequestId, result.copy(requestId = durableRequestId)))
+          .getOrElse(state.get(durableRequestId))
+        audit.putIfAbsent((durable.requestId, durable.decisionId), event.copy(requestId = durable.requestId, decisionId = durable.decisionId))
+        durable
       }
 
     override def pendingAudit(limit: Int): Future[Vector[TransitionEvent]] =

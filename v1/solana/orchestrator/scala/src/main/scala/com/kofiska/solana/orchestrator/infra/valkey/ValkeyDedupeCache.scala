@@ -3,7 +3,7 @@ package com.kofiska.solana.orchestrator.infra.valkey
 import com.kofiska.solana.orchestrator.ports.DedupeCache
 import io.lettuce.core.SetArgs
 import io.lettuce.core.codec.StringCodec
-import io.lettuce.core.{RedisClient, RedisURI}
+import io.lettuce.core.{KeyScanCursor, RedisClient, RedisURI, ScanArgs, ScanCursor}
 
 import java.time.Duration
 import scala.concurrent.{ExecutionContext, Future, blocking}
@@ -28,7 +28,23 @@ final class ValkeyDedupeCache(redisUri: String)(implicit ec: ExecutionContext) e
     Future(blocking { execute(_.del(key(requestId))); () })
 
   override def scan(prefix: String, limit: Int): Future[Vector[String]] =
-    Future(blocking { execute(_.keys(s"$prefix*")).asScala.take(limit).toVector.map(_.toString) })
+    Future(blocking {
+      execute { commands =>
+        val builder = Vector.newBuilder[String]
+        var count = 0
+        var cursor: ScanCursor = ScanCursor.INITIAL
+        val args = ScanArgs.Builder.matches(s"$prefix*").limit(math.max(1, math.min(limit, 1000)))
+        do {
+          val scanned: KeyScanCursor[String] = commands.scan(cursor, args)
+          cursor = scanned
+          val remaining = limit - count
+          val keys = scanned.getKeys.asScala.take(remaining).toVector
+          builder ++= keys
+          count += keys.size
+        } while (!cursor.isFinished && count < limit)
+        builder.result()
+      }
+    })
 
   private def key(requestId: String): String =
     s"solana:dedupe:$requestId"

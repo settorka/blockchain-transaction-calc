@@ -19,7 +19,7 @@ final class RequestWorkflow(
 )(implicit ec: ExecutionContext) {
 
   def process(ctx: RequestContext): Future[DecisionResult] =
-    dedupeCache.claim(ctx.requestId, inflightMarker(ctx), dedupeTtlSeconds).flatMap {
+    dedupeCache.claim(ctx.dedupeKey, inflightMarker(ctx), dedupeTtlSeconds).flatMap {
       case true =>
         val computeResult = Try(computeGateway.evaluate(ctx)).getOrElse(
           Future.failed(new IllegalStateException("compute gateway failed to start"))
@@ -31,18 +31,18 @@ final class RequestWorkflow(
           }
           .flatMap {
             case Right(response) =>
-              val result = resultFromResponse(ctx, response)
+              val result = validatedResultFromResponse(ctx, response)
               persistAndAudit(ctx, result, response.computeLatencyMs.toLong)
             case Left(result) =>
               persistAndAudit(ctx, result, 0L)
           }
 
       case false =>
-        decisionRepository.find(ctx.requestId).flatMap {
+        findDurable(ctx).flatMap {
           case Some(result) =>
             auditPublisher
               .publish(replayEvent(ctx, result))
-              .flatMap(_ => decisionRepository.markAuditPublished(ctx.requestId, result.decisionId))
+              .flatMap(_ => decisionRepository.markAuditPublished(result.requestId, result.decisionId))
               .recover { case _ => () }
               .map(_ => result)
           case None =>
@@ -57,14 +57,34 @@ final class RequestWorkflow(
   ): Future[DecisionResult] = {
     val event = transitionEvent(ctx, result, computeLatencyMs)
     for {
-      _ <- decisionRepository.upsert(ctx, result, event)
+      durable <- decisionRepository.upsert(ctx, result, event)
+      auditEvent = if (durable.requestId == result.requestId && durable.decisionId == result.decisionId) {
+        transitionEvent(ctx.copy(requestId = durable.requestId), durable, computeLatencyMs)
+      } else {
+        replayEvent(ctx, durable)
+      }
       _ <- auditPublisher
-        .publish(event)
-        .flatMap(_ => decisionRepository.markAuditPublished(ctx.requestId, result.decisionId))
+        .publish(auditEvent)
+        .flatMap(_ => decisionRepository.markAuditPublished(durable.requestId, durable.decisionId))
         .recover { case _ => () }
-      _ <- dedupeCache.put(ctx.requestId, result.decisionId, ttlSeconds = dedupeTtlSeconds).recover { case _ => () }
-    } yield result
+      _ <- dedupeCache.put(ctx.dedupeKey, durable.decisionId, ttlSeconds = dedupeTtlSeconds).recover { case _ => () }
+    } yield durable
   }
+
+  private def findDurable(ctx: RequestContext): Future[Option[DecisionResult]] =
+    decisionRepository.findByDedupeKey(ctx.dedupeKey).flatMap {
+      case some @ Some(_) => Future.successful(some)
+      case None           => decisionRepository.find(ctx.requestId)
+    }
+
+  private def validatedResultFromResponse(ctx: RequestContext, response: EvaluateSwapResponse): DecisionResult =
+    if (response.requestId != ctx.requestId) {
+      failedComputeResult(ctx, "COMPUTE_RESPONSE_REQUEST_ID_MISMATCH")
+    } else if (response.sourceHashes.toVector != ctx.sourceHashes) {
+      failedComputeResult(ctx, "COMPUTE_RESPONSE_SOURCE_HASH_MISMATCH")
+    } else {
+      resultFromResponse(ctx, response)
+    }
 
   private def resultFromResponse(ctx: RequestContext, response: EvaluateSwapResponse): DecisionResult = {
     val terminalState = response.terminalState match {

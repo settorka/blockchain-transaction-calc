@@ -49,7 +49,26 @@ final class JdbcDecisionRepository(
       }
     })
 
-  override def upsert(ctx: RequestContext, result: DecisionResult, event: TransitionEvent): Future[Unit] =
+  override def findByDedupeKey(dedupeKey: String): Future[Option[DecisionResult]] =
+    Future(blocking {
+      Using.resource(connection) { conn =>
+        val statement = conn.prepareStatement(
+          """SELECT request_id, decision_id, terminal_state, reason_code, actionability, route_id,
+            |expected_output, fee_cost, slippage_cost, breakeven_margin, ev_estimate, ev_lower_bound,
+            |risk_score, freshness_valid, source_hashes
+            |FROM decisions
+            |WHERE dedupe_key = ?""".stripMargin
+        )
+        Using.resource(statement) { ps =>
+          ps.setQueryTimeout(5)
+          ps.setString(1, dedupeKey)
+          val rows = ps.executeQuery()
+          if (rows.next()) Some(rowToDecision(rows)) else None
+        }
+      }
+    })
+
+  override def upsert(ctx: RequestContext, result: DecisionResult, event: TransitionEvent): Future[DecisionResult] =
     Future(blocking {
       Using.resource(connection) { conn =>
         conn.setAutoCommit(false)
@@ -60,7 +79,7 @@ final class JdbcDecisionRepository(
               |model_version, route_id, slot, quote_age, source_hashes, expected_output, fee_cost,
               |slippage_cost, breakeven_margin, ev_estimate, ev_lower_bound, risk_score, freshness_valid
               |) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-              |ON CONFLICT (request_id) DO NOTHING""".stripMargin
+              |ON CONFLICT DO NOTHING""".stripMargin
           )
           Using.resource(decisionStatement) { ps =>
             ps.setQueryTimeout(5)
@@ -87,36 +106,20 @@ final class JdbcDecisionRepository(
             ps.executeUpdate()
           }
 
-          val outboxStatement = conn.prepareStatement(
-            """INSERT INTO audit_outbox (
-              |request_id, decision_id, schema_version, trace_id, terminal_state, reason_code, model_version,
-              |route_id, slot, quote_age, source_hashes, stage, latency_ms, bytes_in, bytes_out, success
-              |) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-              |ON CONFLICT (request_id, decision_id) DO NOTHING""".stripMargin
-          )
-          Using.resource(outboxStatement) { ps =>
-            ps.setQueryTimeout(5)
-            ps.setString(1, event.requestId)
-            ps.setString(2, event.decisionId)
-            ps.setString(3, event.schemaVersion)
-            ps.setString(4, event.traceId)
-            ps.setString(5, event.terminalState)
-            ps.setString(6, event.reasonCode)
-            ps.setString(7, event.modelVersion)
-            ps.setString(8, event.routeId.orNull)
-            ps.setLong(9, event.slot)
-            ps.setLong(10, event.quoteAge)
-            ps.setArray(11, conn.createArrayOf("text", event.sourceHashes.map(_.asInstanceOf[AnyRef]).toArray))
-            ps.setString(12, event.stage)
-            ps.setLong(13, event.latencyMs)
-            ps.setLong(14, event.bytesIn)
-            ps.setLong(15, event.bytesOut)
-            ps.setBoolean(16, event.success)
-            ps.executeUpdate()
+          val durable = selectDurable(conn, ctx).getOrElse {
+            throw new IllegalStateException(s"decision upsert produced no durable row for ${ctx.requestId}")
           }
-
+          insertOutbox(conn, event.copy(
+            requestId = durable.requestId,
+            decisionId = durable.decisionId,
+            terminalState = TerminalState.asString(durable.terminalState),
+            reasonCode = durable.reasonCode,
+            routeId = durable.bestRouteId,
+            sourceHashes = durable.sourceHashes,
+            success = durable.terminalState != TerminalState.Failed
+          ))
           conn.commit()
-          ()
+          durable
         } catch {
           case error: Throwable =>
             conn.rollback()
@@ -126,6 +129,56 @@ final class JdbcDecisionRepository(
         }
       }
     })
+
+  private def selectDurable(conn: Connection, ctx: RequestContext): Option[DecisionResult] = {
+    val statement = conn.prepareStatement(
+      """SELECT request_id, decision_id, terminal_state, reason_code, actionability, route_id,
+        |expected_output, fee_cost, slippage_cost, breakeven_margin, ev_estimate, ev_lower_bound,
+        |risk_score, freshness_valid, source_hashes
+        |FROM decisions
+        |WHERE request_id = ? OR dedupe_key = ?
+        |ORDER BY created_at ASC
+        |LIMIT 1""".stripMargin
+    )
+    Using.resource(statement) { ps =>
+      ps.setQueryTimeout(5)
+      ps.setString(1, ctx.requestId)
+      ps.setString(2, ctx.dedupeKey)
+      val rows = ps.executeQuery()
+      if (rows.next()) Some(rowToDecision(rows)) else None
+    }
+  }
+
+  private def insertOutbox(conn: Connection, event: TransitionEvent): Unit = {
+    val outboxStatement = conn.prepareStatement(
+      """INSERT INTO audit_outbox (
+        |request_id, decision_id, schema_version, trace_id, terminal_state, reason_code, model_version,
+        |route_id, slot, quote_age, source_hashes, stage, latency_ms, bytes_in, bytes_out, success
+        |) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        |ON CONFLICT (request_id, decision_id) DO NOTHING""".stripMargin
+    )
+    Using.resource(outboxStatement) { ps =>
+      ps.setQueryTimeout(5)
+      ps.setString(1, event.requestId)
+      ps.setString(2, event.decisionId)
+      ps.setString(3, event.schemaVersion)
+      ps.setString(4, event.traceId)
+      ps.setString(5, event.terminalState)
+      ps.setString(6, event.reasonCode)
+      ps.setString(7, event.modelVersion)
+      ps.setString(8, event.routeId.orNull)
+      ps.setLong(9, event.slot)
+      ps.setLong(10, event.quoteAge)
+      ps.setArray(11, conn.createArrayOf("text", event.sourceHashes.map(_.asInstanceOf[AnyRef]).toArray))
+      ps.setString(12, event.stage)
+      ps.setLong(13, event.latencyMs)
+      ps.setLong(14, event.bytesIn)
+      ps.setLong(15, event.bytesOut)
+      ps.setBoolean(16, event.success)
+      ps.executeUpdate()
+      ()
+    }
+  }
 
   override def pendingAudit(limit: Int): Future[Vector[TransitionEvent]] =
     Future(blocking {

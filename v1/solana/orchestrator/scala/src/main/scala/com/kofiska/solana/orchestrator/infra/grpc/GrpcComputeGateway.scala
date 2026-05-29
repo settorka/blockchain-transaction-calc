@@ -5,6 +5,7 @@ import com.kofiska.solana.orchestrator.ports.ComputeGateway
 import com.kofiska.solana.v1.decision.{ComputeServiceGrpc, EvaluateSwapRequest, EvaluateSwapResponse, RouteCandidate}
 
 import io.grpc.ManagedChannel
+import java.util.concurrent.TimeUnit
 import scala.concurrent.Future
 
 final class GrpcComputeGateway(channel: ManagedChannel) extends ComputeGateway {
@@ -32,6 +33,6 @@ final class GrpcComputeGateway(channel: ManagedChannel) extends ComputeGateway {
       }
     )
 
-    stub.evaluateSwap(request)
+    stub.withDeadlineAfter(5, TimeUnit.SECONDS).evaluateSwap(request)
   }
 }
