@@ -10,6 +10,20 @@ Primary workload:
 - request dedupe and replay-safe decisioning
 - audit and recovery around pre-trade requests
 
+```mermaid
+flowchart LR
+    client["Swap-preflight request"] --> scala["Scala orchestrator"]
+    scala --> dedupe["Valkey dedupe cache"]
+    scala --> store["PostgreSQL decision store"]
+    scala --> audit["Redpanda audit stream"]
+    scala --> grpc["gRPC boundary"]
+    grpc --> rust["Rust compute service"]
+    rust --> compute["Quote, route, slippage, fee, EV, risk"]
+    compute --> grpc
+    grpc --> scala
+    scala --> terminal["Accept, defer, reject, or fail closed"]
+```
+
 - observed now: v0 is in-process Scala only
 - observed now: no measured cross-runtime cost
 - observed now: no Rust boundary yet
@@ -56,6 +70,24 @@ State machine reality:
 - every request ends in exactly one terminal outcome
 - every duplicate request resolves to a recorded terminal state, not a new execution
 - the machine is the control plane; compute is an implementation detail of one transition
+
+```mermaid
+stateDiagram-v2
+    [*] --> Received
+    Received --> Normalized
+    Normalized --> Deduped
+    Deduped --> Terminal: duplicate recorded
+    Deduped --> Classified
+    Classified --> Terminal: malformed or rejected
+    Classified --> Queued
+    Queued --> Dispatched
+    Dispatched --> Computing
+    Computing --> Persisted
+    Computing --> Terminal: compute failure or defer
+    Persisted --> Audited
+    Audited --> Terminal
+    Terminal --> [*]
+```
 
 ## Typed model
 
