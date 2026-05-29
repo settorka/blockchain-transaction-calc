@@ -17,6 +17,14 @@ v0 is an in-process Scala ledger demo. The core object is `Calculator`, which ta
 
 The model is local and in-memory. There is no request envelope, no request identity, no durable state, no replay log, no transport boundary, and no persistence layer.
 
+```mermaid
+flowchart LR
+    input["Local caller"] --> calc["Calculator"]
+    calc --> state["Immutable Map[String, Double]"]
+    state --> result["New map or TransactionError"]
+    result --> owner["Caller owns next state"]
+```
+
 ### Implementation Shape
 
 The implementation uses Scala's immutable collections and basic pattern matching. The code path is simple:
@@ -42,6 +50,18 @@ The concurrency shape is:
 - random amount generation
 - random choice between add and subtract
 - repeated work across multiple Futures
+
+```mermaid
+flowchart LR
+    driver["Integration test / caller"] --> futures["Scala Futures"]
+    futures --> workA["Random add/subtract work"]
+    futures --> workB["Random add/subtract work"]
+    futures --> workC["Random add/subtract work"]
+    workA --> shared["Shared in-memory accounts value"]
+    workB --> shared
+    workC --> shared
+    shared --> final["Non-durable final state"]
+```
 
 The concurrency test does not establish safe shared-state behavior. The test code in `IntegrationTest` mutates a shared `var accounts` inside concurrent Futures. That is race-prone and non-deterministic. The code comments even acknowledge the need for thread-safety if the state were mutable.
 
