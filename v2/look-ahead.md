@@ -1,6 +1,6 @@
-# v2 Look Ahead (Contract)
+# v2 Look Ahead
 
-v2 is a live, non-executing Solana swap preflight decision service.
+v2 is a Solana swap preflight decision service.
 
 It answers one question:
 
@@ -8,86 +8,145 @@ It answers one question:
 Given a proposed Solana swap, should it be ACCEPT, DEFER, REJECT, or FAILED_CLOSED?
 ```
 
-It must use real Solana/market context, and it must be structurally unable to move funds.
+It must use Solana/market context, and it must be unable to move funds.
 
 ## Plane Model
 
-v2 is a plane-separated microservice deployment in a GCP VPC.
+v2 is a microservice deployment in a GCP VPC.
 
 - Entry plane: REST ingress (Scala control plane).
 - Control plane: Scala (Akka) owns lifecycle, policy, dedupe/replay, persistence, outbox, reconciliation, stop-accept.
-- Compute plane: Rust owns bounded numeric compute behind internal gRPC.
+- Compute plane: Rust owns numeric compute behind internal gRPC.
 - Data plane: Postgres is the durability boundary; Valkey is a cache acceleration only.
-- Audit plane: Redpanda is downstream distribution; outbox in Postgres is authoritative evidence.
+- Audit plane: Redpanda is downstream distribution; outbox in Postgres is evidence.
 
-## Entry Boundary (Explicit)
+## Architecture Boundaries
 
-- v2 MUST expose a REST ingress for requests.
+Planes map to microservices.
+
+Control plane:
+
+- `control` (Scala): REST ingress + lifecycle + policy + persistence + outbox + reconciliation.
+
+Compute plane:
+
+- `compute` (Rust): gRPC compute.
+
+Data plane:
+
+- `postgres`: decisions + outbox tables.
+- `valkey`: dedupe cache.
+
+Audit plane:
+
+- `redpanda`: audit stream sink fed by outbox shipper.
+
+Only REST ingress is exposed. Everything else is internal.
+
+```mermaid
+flowchart TB
+    EXT["Caller"] --> REST["REST ingress"]
+
+    subgraph CONTROL["Control plane"]
+        CTRL["control (Scala)"]
+    end
+
+    subgraph COMPUTE["Compute plane"]
+        GRPC["compute (Rust gRPC)"]
+    end
+
+    subgraph DATA["Data plane"]
+        PG["postgres"]
+        VK["valkey"]
+        OB["outbox shipper"]
+    end
+
+    subgraph AUDIT["Audit plane"]
+        RP["redpanda"]
+    end
+
+    REST --> CTRL
+    CTRL --> GRPC
+    GRPC --> CTRL
+    CTRL --> PG
+    CTRL --> VK
+    CTRL --> OB
+    OB --> PG
+    OB --> RP
+```
+
+## Entry Boundary
+
+- v2 MUST expose a REST ingress.
 - Access MUST be gated by a GCP firewall IP allowlist to your PC (no broad public access).
-- The service MUST enforce request authentication and rate/burst limits even behind the allowlist.
-- Internal Scala->Rust MUST remain gRPC with strict deadlines and cancellation.
+- The service MUST enforce request authentication and rate/burst limits.
+- Internal Scala->Rust MUST remain gRPC with deadlines and cancellation.
 
-## Out Of Scope (Non-Negotiable)
+## Out Of Scope
 
 v2 MUST NOT include:
 
 - signer, private keys, custody
 - transaction construction or submission
-- any “forward-to-executor” or execution-adjacent mode
+- any “forward-to-executor” mode
 
 v3 is where execution and monetized business maturity can be considered.
 
-## Hard Invariants (Must / Must Not)
+## Invariants
 
 Request identity and terminalization:
 
 - Every request MUST carry `request_id` and `dedupe_key`.
-- Exactly-once terminalization MUST be enforced by durable uniqueness (database), not cache best-effort.
+- Exactly-once terminalization MUST be enforced by uniqueness (database).
 - Every logical request MUST end in exactly one terminal outcome.
-- Duplicate requests MUST replay durable truth (return the recorded terminal decision), never recompute as the source of truth.
+- Duplicate requests MUST return the recorded terminal decision.
 
 Durability and audit evidence:
 
 - The system MUST persist the terminal decision before acknowledging it.
 - The system MUST write an audit outbox row in the same Postgres transaction as the terminal decision.
 - `ACCEPT` MUST NOT be returned unless the decision+outbox transaction commits.
-- Redpanda availability MUST NOT be a synchronous prerequisite for `ACCEPT` (outbox shipping is asynchronous and measurable).
+- Redpanda availability MUST NOT be a prerequisite for `ACCEPT`.
+- Outbox shipping MUST handle poison rows:
+  - One bad outbox row MUST NOT block shipping of later rows.
+  - Outbox rows MUST have a terminal state (`sent` or `dead`) with an error reason.
+  - Invalid outbox payload generation is a stop-accept condition.
 
 Bounds:
 
-- Ingress MUST enforce hard numeric limits (request bytes, routes, hops, inflight, queue depth, retries, request lifetime).
-- Rust compute MUST enforce hard numeric limits (routes, hops, numeric ranges) and MUST run under a strict deadline.
-- Overload MUST fail closed fast (`FAILED_CLOSED`), never silently backlog until OOM.
+- Ingress MUST enforce numeric limits (request bytes, routes, hops, inflight, queue depth, retries, request lifetime).
+- Rust compute MUST enforce numeric limits (routes, hops, numeric ranges) and MUST run under a deadline.
+- Overload MUST fail closed (`FAILED_CLOSED`).
 
 No execution:
 
-- v2 MUST be structurally unable to execute swaps: no signer, no tx submission path, no keys, no execution libraries.
+- v2 MUST be unable to execute swaps: no signer, no tx submission path, no keys, no execution libraries.
 - Startup MUST fail if any execution configuration is present.
 - Tests MUST prove there is no execution or execution-adjacent path.
 
-Reconstructible `ACCEPT` (definition, not vibes):
+Reconstructible `ACCEPT`:
 
 - For every `ACCEPT`, the system MUST be able to retrieve:
   - canonical normalized input bytes
-  - canonical source snapshot bytes (or an immutable pointer to stored bytes)
+  - canonical source snapshot bytes (or a pointer to stored bytes)
   - deterministic `source_snapshot_hash` for those bytes
   - exact policy bundle version (limits + supported lists + gate thresholds)
   - exact model/config version
   - exact release/version identifier
-  - gate evaluation trace sufficient to justify the decision
-- If any required artifact is missing, stale, ambiguous, or conflict-ridden, `ACCEPT` is illegal.
+  - gate evaluation trace to justify the decision
+- If any required artifact is missing, ambiguous, or conflict-ridden, `ACCEPT` is illegal.
 
-## Source-Of-Truth Policy (Market Adapter)
+## Source-Of-Truth Policy
 
 The caller MUST NOT be trusted to provide truth.
 
-- The market adapter MUST build a canonical source snapshot from explicitly defined providers.
+- The market adapter MUST build a canonical source snapshot from defined providers.
 - Decision throughput MUST be decoupled from provider call rate:
   - snapshots are polled/cached asynchronously under bounds
   - per-request RPC/quote fetching is forbidden for go-live
-- Provider conflict MUST be detected and MUST block `ACCEPT` (fail closed or defer; policy-defined, but never “pick one silently”).
+- Provider conflict MUST be detected and MUST block `ACCEPT`.
 
-Required snapshot contents (minimum):
+Snapshot contents:
 
 - token mints, decimals, and supported-token status
 - amount in integer base units
@@ -95,11 +154,11 @@ Required snapshot contents (minimum):
 - program/venue identity (allowed list applies)
 - fee context, liquidity signal, confidence, timestamp
 - Solana slot and quote age (slot + wall-clock)
-- canonical snapshot bytes + snapshot schema version + deterministic snapshot hash
+- canonical snapshot bytes + snapshot schema version + snapshot hash
 
-## `ACCEPT` Rule (Gate Contract)
+## `ACCEPT` Rule
 
-`ACCEPT` is allowed only when every gate evaluates TRUE under the active approved policy bundle:
+`ACCEPT` is allowed only when every gate evaluates TRUE under the active policy bundle:
 
 ```text
 EV_lower_bound > operating_cost
@@ -128,9 +187,9 @@ outbox_writable = true
 compute_within_budget = true
 ```
 
-Unknown, missing, stale, or untrusted inputs MUST NOT produce `ACCEPT`.
+Unknown, missing, or untrusted inputs MUST NOT produce `ACCEPT`.
 
-## Stop-Accept Conditions (Fail Closed)
+## Stop-Accept Conditions
 
 Stop emitting new `ACCEPT` decisions when any is true:
 
@@ -138,13 +197,13 @@ Stop emitting new `ACCEPT` decisions when any is true:
 - Market adapter cannot build fresh, complete, conflict-free snapshots.
 - Rust compute is unavailable or deadline failures breach threshold.
 - Queue age exceeds bound or inflight exceeds bound.
-- Dedupe drift is detected (terminal mismatch between cache and durable truth).
+- Dedupe drift is detected (terminal mismatch between cache and database truth).
 - Exposure accounting cannot be evaluated or is at/over limit.
 - Policy bundle or model/config version is unknown, unapproved, or inconsistent.
 
 ## Evidence (Required Fields)
 
-Every terminal decision MUST carry (at minimum):
+Every terminal decision MUST carry (at least):
 
 - `trace_id`
 - `request_id`
@@ -171,14 +230,15 @@ Every terminal decision MUST carry (at minimum):
 - `exposure_limit`
 - `decision_expires_at`
 
-## Go-Live Proof (Minimum)
+## Go-Live Proof
 
-v2 is not “live” until each is proven end-to-end:
+v2 is not go-live until each is proven end-to-end:
 
 1. REST ingress is deployed behind a firewall IP allowlist and enforces auth + bounds + deadlines.
-2. Canonical snapshots exist (bytes + schema + deterministic hash) and are referenced by decisions.
-3. Exactly-once terminalization is DB-enforced and duplicate replay returns durable truth.
+2. Canonical snapshots exist (bytes + schema + hash) and are referenced by decisions.
+3. Exactly-once terminalization is DB-enforced and duplicate replay returns database truth.
 4. `ACCEPT` implies a committed decision+outbox transaction in Postgres.
 5. Outbox shipping to Redpanda is idempotent; lag is measured; stop-accept threshold exists.
+5a. Outbox shipping handles poison rows (dead-letter exists; poison count is visible; poison does not block shipping).
 6. No-execution proof holds (build/startup/test guards).
-7. Load + failure tests demonstrate bounded behavior at `1,000,000 ops/hour` decision throughput using cached snapshots (not per-request RPC).
+7. Load + failure tests demonstrate behavior at `1,000,000 ops/hour` decision throughput using cached snapshots (not per-request RPC).

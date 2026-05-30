@@ -66,6 +66,43 @@ One-line definition:
 This is a bounded, replay-safe, auditable Solana swap preflight decision service.
 ```
 
+## Position In The Swap Stack
+
+This service sits between a route provider and an executor.
+
+- Route provider: proposes route candidates and quotes for an intent.
+- This service: decides whether forwarding is allowed, and returns a decision with evidence and expiry.
+- Executor: signs and submits transactions if and only if the decision permits it.
+
+```mermaid
+flowchart TB
+  subgraph ENTRY["Entry"]
+    UI["User / UI"] --> INTENT["Swap intent"]
+  end
+
+  subgraph ROUTE["Route"]
+    ROUTER["Route provider"]
+    CAND["Route candidates + quote"]
+    INTENT --> ROUTER --> CAND
+  end
+
+  subgraph CONTROL["Control"]
+    GATE["Preflight decision service (this repo)"]
+    CAND --> GATE
+    GATE -->|ACCEPT + evidence + expiry| EXEC
+    GATE -->|DEFER / REJECT / FAILED| STOP["No forward"]
+  end
+
+  subgraph EXEC_PLANE["Execution"]
+    EXEC["Executor"]
+  end
+
+  subgraph LEDGER["Ledger"]
+    NET["Solana network"]
+    EXEC --> NET
+  end
+```
+
 Core ownership:
 
 - Scala owns request lifecycle, state, policy, replay, persistence, and audit.
@@ -116,6 +153,11 @@ Conclusion: `v0` proves local arithmetic only. It is not the operational archite
 Status: bounded Solana swap-preflight decision service.
 
 Target posture: correctness under controlled load.
+
+Notes:
+
+- v1 does not expose a remote REST/HTTP boundary yet. Ingress is internal (Akka actor messages / benchmarks).
+- gRPC in v1 is the Scala->Rust compute boundary.
 
 Request shape:
 
@@ -184,19 +226,19 @@ v1 does not claim mainnet economic proof. It proves bounded decision behavior, d
 
 ## v2: Distributed Operating Edge
 
-Status: first live production-grade operating target.
+Status: first go-live target.
 
-Target posture: operate the preflight decision service with production-grade rigor while keeping swap execution out of scope.
+Target posture: operate the preflight decision service while keeping swap execution out of scope.
 
 Design:
 
-- Scala Akka Cluster actors orchestrate distributed request flow.
-- Actor partitioning is keyed by request, market, or other consistency boundary.
-- Heavy Solana compute remains offloaded to Rust.
-- Rust compute scales independently from Scala orchestration.
-- Initial deployment may be a single GCP instance running the compose stack.
-- Terraform must own the production infrastructure shape under `v2/prod/deployment/terraform/gcp`.
-- A runbook is required.
+- Microservice split in a VPC:
+  - control plane: Scala REST ingress + policy + lifecycle + persistence + outbox + reconciliation
+  - compute plane: Rust gRPC compute
+  - data plane: Postgres (decisions + outbox), Valkey (dedupe cache)
+  - audit plane: Redpanda (outbox shipping sink)
+- Only REST ingress is exposed; everything else is internal.
+- `ACCEPT` requires a committed Postgres decision + outbox write.
 
 Required controls:
 
