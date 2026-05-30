@@ -136,6 +136,19 @@ Reconstructible `ACCEPT`:
   - gate evaluation trace to justify the decision
 - If any required artifact is missing, ambiguous, or conflict-ridden, `ACCEPT` is illegal.
 
+## Guarantees
+
+The system guarantees the following behaviors when the invariants hold:
+
+- A duplicate request returns the same terminal decision as the first terminalized request for the same `dedupe_key`.
+- A terminal decision has a corresponding outbox row committed in the same Postgres transaction.
+- `ACCEPT` implies:
+  - a committed decision row exists
+  - a committed outbox row exists
+  - referenced evidence exists (input bytes, snapshot bytes or pointer, hashes, versions)
+- Redpanda can be unavailable without permitting an `ACCEPT` that lacks a committed outbox record.
+- One poison outbox row does not prevent later outbox rows from being shipped.
+
 ## Source-Of-Truth Policy
 
 The caller MUST NOT be trusted to provide truth.
