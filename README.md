@@ -6,6 +6,66 @@ This repository evolves a local transaction calculator into a Solana swap decisi
 
 The system decides whether a swap request should be `accept`, `defer`, `reject`, or `fail_closed`. It is a pre-trade decision layer, not a swap executor.
 
+## Problem
+
+We are building a Solana swap preflight decision engine.
+
+It is not a wallet, not a swap executor, not a trading bot, and not an on-chain program.
+
+The system answers one question:
+
+```text
+Given a proposed Solana swap, should this request be forwarded, deferred, rejected, or failed closed?
+```
+
+A caller sends a proposed swap intent:
+
+```text
+USDC -> SOL
+amount
+route candidates
+quote age / slot
+source hashes
+dedupe key
+request id
+```
+
+The system must:
+
+1. Normalize the request.
+2. Check dedupe and replay.
+3. Validate freshness.
+4. Validate source integrity.
+5. Score route candidates.
+6. Estimate fees.
+7. Estimate slippage.
+8. Compute breakeven.
+9. Compute `EV_estimate`.
+10. Compute `EV_lower_bound`.
+11. Apply risk gates.
+12. Produce a terminal decision.
+13. Persist the decision.
+14. Emit an audit event.
+15. Return the decision to the caller.
+
+The output is:
+
+```text
+ACCEPT | DEFER | REJECT | FAILED
+```
+
+`ACCEPT` means the proposed swap clears the preflight economic and operational gates. It does not mean the swap was executed.
+
+Solana is involved as decision context: slot freshness, quote age, route candidates, liquidity/source hashes, fee estimation, slippage estimation, route risk, and source conflict detection. v2 may use devnet or simulation as an input-validation layer, but the system still does not run the swap.
+
+The system exists to prevent bad forwarding decisions: stale swaps, duplicate swaps, negative-EV swaps, high-risk routes, conflicting source data, wasted downstream execution capacity, and decisions that cannot be replayed or audited.
+
+One-line definition:
+
+```text
+This is a bounded, replay-safe, auditable Solana swap preflight decision service.
+```
+
 Core ownership:
 
 - Scala owns request lifecycle, state, policy, replay, persistence, and audit.
@@ -26,6 +86,8 @@ Core ownership:
 ## v0: Local Scala Prototype
 
 Status: local computation proof.
+
+v0 made weak production claims because it only proved local arithmetic. It did not model a Solana swap preflight request, did not carry durable identity, did not persist terminal outcomes, did not suppress duplicates, did not audit, and did not define a transport boundary. Its concurrency path used Futures around local state, not a bounded request lifecycle.
 
 Scope:
 
@@ -112,22 +174,29 @@ gRPC decision:
 - required for independent scaling of Rust compute
 - required for containerized service boundaries
 
+FFI was dropped as the runtime boundary because it couples Scala process health to Rust memory/runtime behavior, makes isolation and independent scaling harder, complicates deploy and rollback, and hides boundary cost inside a single process. gRPC makes the cross-runtime contract explicit, observable, timeout-bound, and service-deployable.
+
+Rust compute is offloaded because quote, route, slippage, fee, breakeven, EV, freshness, and risk calculations are the hot numeric path. Scala remains the control plane because request lifecycle, policy, replay, persistence, audit, and recovery need coherent state ownership.
+
 v1 target: `1,000,000 ops/hour` as a budget, equal to about `277.78 ops/sec`.
 
 v1 does not claim mainnet economic proof. It proves bounded decision behavior, durable replay, auditability, and positive lower-bound EV gating under controlled benchmark conditions.
 
 ## v2: Distributed Operating Edge
 
-Status: planned distributed system target.
+Status: first live production-grade operating target.
 
-Target posture: make the `1,000,000 ops/hour` budget operationally credible.
+Target posture: operate the preflight decision service with production-grade rigor while keeping swap execution out of scope.
 
 Design:
 
-- Scala Akka actors orchestrate distributed request flow.
+- Scala Akka Cluster actors orchestrate distributed request flow.
 - Actor partitioning is keyed by request, market, or other consistency boundary.
 - Heavy Solana compute remains offloaded to Rust.
 - Rust compute scales independently from Scala orchestration.
+- Initial deployment may be a single GCP instance running the compose stack.
+- Terraform must own the production infrastructure shape under `v2/prod/deployment/terraform/gcp`.
+- A runbook is required.
 
 Required controls:
 
@@ -142,6 +211,7 @@ Required controls:
 - replay across restart and redeploy
 - cost per decision
 - cost per accepted decision
+- explicit resource ceilings for CPU, memory, disk, queues, workers, gRPC calls, database pools, cache connections, and audit backlog
 
 Health model:
 
@@ -160,9 +230,9 @@ v2 success requires accepted requests to clear lower-bound EV, operating cost, f
 
 ## v3: Solana Mainnet Target
 
-Status: planned mainnet-readiness target.
+Status: business-mature Solana expansion target.
 
-Target posture: survive real Solana chain and market conditions.
+Target posture: close the gap between preflight decisions and real Solana business outcomes.
 
 Mainnet risks:
 
@@ -210,9 +280,11 @@ Required realized-outcome tracking:
 
 v3 must close the loop between decision EV and settled Solana outcome. The system must stop accepting when RPC confidence drops, source hashes conflict, slot lag grows, route validity decays, audit coverage breaks, fees exceed limits, or realized EV diverges from the model.
 
+With the current boundary, v3 is where mainnet execution maturity belongs if the system expands beyond preflight decisions. v3 must decide whether to integrate transaction construction, signing, submission, confirmation, settlement, and realized-EV reconciliation. Until then, v1 and v2 remain non-custodial preflight decision systems.
+
 ## Version Summary
 
 - `v0`: local Scala arithmetic proof.
 - `v1`: bounded Scala/Rust/gRPC decision system with durable replay and audit.
-- `v2`: distributed Akka-led orchestration with independently scalable Rust compute, OTEL, Jaeger, SLI/SLO/SLAs defined , and `1M ops/hour` operating target.
-- `v3`: Solana mainnet target with chain-aware execution, settlement, fee, routing, freshness, and realized-EV controls.
+- `v2`: production-grade Akka Cluster orchestration with independently scalable Rust compute, Terraform/GCP deployment, runbook, bounded resources, OTEL, Jaeger, SLI/SLO/SLA posture, and `1M ops/hour` operating target.
+- `v3`: business-mature Solana expansion with possible mainnet execution, settlement, fee, routing, freshness, and realized-EV controls.
