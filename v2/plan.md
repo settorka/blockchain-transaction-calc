@@ -4,6 +4,15 @@ This plan expands the critical v2 contract in [`look-ahead.md`](./look-ahead.md)
 
 It must run live as a non-executing Solana swap preflight decision service. It must use real Solana/market context, prove bounded operation, and make every `ACCEPT` decision reconstructible.
 
+v2 is a plane-separated microservice target in a GCP VPC:
+
+- Entry + control plane: Scala (Akka) REST ingress and policy/lifecycle owner.
+- Compute plane: Rust gRPC compute service (internal only).
+- Data plane: Postgres durability boundary; Valkey cache acceleration only.
+- Audit plane: Redpanda downstream distribution; Postgres outbox is authoritative evidence.
+
+Access model for v2: inbound firewall IP allowlist to your PC for testing, plus app-level auth/bounds.
+
 ## Design Evolution
 
 v1 already establishes the core control loop:
@@ -16,131 +25,49 @@ v1 already establishes the core control loop:
 
 v2 evolves that loop into a live non-executing Solana decision system:
 
-- Add a real Solana source layer before policy and compute.
-- Add a market adapter that builds canonical source snapshots.
-- Move from local actor orchestration toward Akka Cluster ownership and bounded partitioning.
-- Add exposure gates before compute dispatch.
-- Add decision expiry and no-execution proof.
-- Add audit digesting so every terminal decision is reconstructible.
-- Add production observability, Terraform/GCP deployment, runbooks, and failure/load proof.
+- Add a real REST ingress (v1 has no remote entry boundary).
+- Add a Solana source layer + market adapter that produces canonical snapshots (bytes + schema + hash).
+- Decouple decision throughput from Solana/provider call rate via bounded snapshot polling/caching.
+- Enforce exactly-once terminalization via Postgres (cache is not truth).
+- Commit decision + outbox in one Postgres transaction; ship to Redpanda asynchronously.
+- Gate `ACCEPT` on approved policy bundle + model/config versions + evidence completeness.
+- Run as plane-separated microservices in a VPC with private gRPC for compute.
 
 ```mermaid
 flowchart TB
-    subgraph INPUT["Request Entry"]
-        CALLER["Caller"]
-        API["v2 API Boundary"]
-        AUTH["Auth / Rate Limit"]
-    end
+    PC["Your PC Scripts"]
+    FW["GCP Firewall Allowlist"]
+    REST["Scala REST Ingress"]
+    CTRL["Scala Control"]
+    SNAP["Snapshot Cache"]
+    GRPC["Rust gRPC Compute"]
+    PG["Postgres"]
+    VK["Valkey"]
+    OB["Outbox Shipper"]
+    RP["Redpanda"]
+    OBS["Observability"]
 
-    subgraph SOURCE["Solana Source Layer"]
-        RPC["Solana RPC Read"]
-        MARKET["Market Adapter"]
-        TOKEN["Token Metadata"]
-        ROUTE_SRC["Quote / Route Source"]
-        FEE_SRC["Fee Context"]
-        SNAPSHOT["Canonical Source Snapshot"]
-    end
+    PC --> FW
+    FW --> REST
+    REST --> CTRL
 
-    subgraph CONTROL["Scala Akka Cluster Control Plane"]
-        INGRESS["Ingress"]
-        SHARD["Shard / Key Ownership"]
-        FSM["Request FSM"]
-        DEDUPE["Dedupe / Replay"]
-        POLICY["Policy Gates"]
-        EXPOSURE["Exposure Gates"]
-        QUEUE["Bounded Queue"]
-        RECON["Reconciliation"]
-    end
+    CTRL --> VK
+    CTRL --> SNAP
+    CTRL --> GRPC
+    GRPC --> CTRL
 
-    subgraph COMPUTE["Rust Compute Plane"]
-        GRPC["gRPC Deadline Boundary"]
-        ROUTE["Route Scoring"]
-        FEE["Fee Estimate"]
-        SLIPPAGE["Slippage Estimate"]
-        BREAKEVEN["Breakeven"]
-        EV["EV Lower Bound"]
-        RISK["Risk / Freshness"]
-    end
+    CTRL --> PG
+    CTRL --> OB
+    OB --> PG
+    OB --> RP
 
-    subgraph DATA["Durable State + Audit"]
-        POSTGRES["Postgres Decisions"]
-        VALKEY["Valkey Dedupe"]
-        OUTBOX["Audit Outbox"]
-        REDPANDA["Redpanda Audit"]
-        DIGEST["Audit Digest"]
-    end
-
-    subgraph OBS["Observability"]
-        OTEL["OpenTelemetry"]
-        JAEGER["Jaeger"]
-        METRICS["Metrics / Dashboards"]
-        ALERTS["Burn-Rate Alerts"]
-        LOGS["Structured Logs"]
-    end
-
-    subgraph OPS["Production Ops"]
-        TF["Terraform / GCP"]
-        COMPOSE["Single-Instance Compose"]
-        RUNBOOK["Runbooks"]
-        BACKUP["Backup / Restore"]
-        LOAD["Load + Failure Tests"]
-    end
-
-    CALLER --> API
-    API --> AUTH
-    AUTH --> INGRESS
-
-    INGRESS --> SHARD
-    SHARD --> FSM
-    FSM --> DEDUPE
-    DEDUPE --> VALKEY
-
-    FSM --> MARKET
-    RPC --> MARKET
-    TOKEN --> MARKET
-    ROUTE_SRC --> MARKET
-    FEE_SRC --> MARKET
-    MARKET --> SNAPSHOT
-    SNAPSHOT --> POLICY
-
-    POLICY --> EXPOSURE
-    EXPOSURE --> QUEUE
-    QUEUE --> GRPC
-
-    GRPC --> ROUTE
-    ROUTE --> FEE
-    FEE --> SLIPPAGE
-    SLIPPAGE --> BREAKEVEN
-    BREAKEVEN --> EV
-    EV --> RISK
-    RISK --> GRPC
-
-    GRPC --> FSM
-    FSM --> POSTGRES
-    FSM --> OUTBOX
-    OUTBOX --> REDPANDA
-    OUTBOX --> DIGEST
-    RECON --> POSTGRES
-    RECON --> VALKEY
-    RECON --> REDPANDA
-
-    CONTROL --> OTEL
-    COMPUTE --> OTEL
-    DATA --> OTEL
-    SOURCE --> OTEL
-    OTEL --> JAEGER
-    OTEL --> METRICS
-    METRICS --> ALERTS
-    CONTROL --> LOGS
-    COMPUTE --> LOGS
-    DATA --> LOGS
-
-    TF --> COMPOSE
-    COMPOSE --> API
-    RUNBOOK --> ALERTS
-    BACKUP --> POSTGRES
-    LOAD --> API
+    CTRL --> OBS
+    GRPC --> OBS
+    PG --> OBS
+    RP --> OBS
 ```
+
+
 
 ## Technical Gaps
 
@@ -393,6 +320,22 @@ flowchart TB
 7. Add Terraform/GCP, compose deployment, secrets, backup/restore, rollback, and runbooks.
 8. Run failure injection, adversarial load, replay, dry-run, and go/no-go checks.
 
+## Go-Live Blockers (Slice)
+
+These are the items that must be closed before calling v2 live. Everything else is follow-on hardening.
+
+1. Production REST ingress boundary exists (Gap 11-12).
+2. Market adapter + canonical snapshots exist (Gap 13-19).
+3. Decision+outbox atomic commit exists (Gap 25, 96-99).
+4. Exactly-once terminalization is DB-enforced and replay-safe (Gap 4-5, 94, 76-78).
+5. Stop-accept is implemented and wired to readiness/health (Gap 43, 49).
+6. No-execution proof exists as code-level guard + tests (Gap 21-22).
+7. Load/failure tests demonstrate bounded operation at the target decision throughput using cached snapshots (Gap 93, plus go-live proof in look-ahead).
+
 ## v2 Done Means
 
-v2 is not done when it can compute a decision. v2 is done when it can prove a live `ACCEPT` was based on real Solana context, bounded resources, approved config, safe economics, supported routes/tokens/programs, durable replay, reconstructible audit evidence, and no execution capability.
+v2 is not done when it can compute a decision. v2 is done when it  
+- can prove a live `ACCEPT` was based on real Solana context, 
+- has bounded resources across the lifecycle, approved config, safe economics, supported routes/tokens/programs, durable replay, reconstructible audit evidence
+
+
