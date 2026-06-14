@@ -42,9 +42,14 @@ CREATE TABLE IF NOT EXISTS audit_outbox (
   bytes_in BIGINT NOT NULL,
   bytes_out BIGINT NOT NULL,
   success BOOLEAN NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  next_retry_at TIMESTAMPTZ,
   published_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY (request_id, decision_id)
 );
 
+CREATE INDEX IF NOT EXISTS audit_outbox_status_retry_idx ON audit_outbox (status, next_retry_at, created_at);
 CREATE INDEX IF NOT EXISTS audit_outbox_pending_idx ON audit_outbox (published_at, created_at);

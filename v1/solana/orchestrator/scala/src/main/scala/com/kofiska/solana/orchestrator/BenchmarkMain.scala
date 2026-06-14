@@ -12,6 +12,7 @@ import io.grpc.ManagedChannelBuilder
 
 import java.nio.charset.StandardCharsets
 import java.util.UUID
+import java.util.concurrent.Executors
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.util.{Random, Try}
@@ -28,43 +29,52 @@ object BenchmarkMain {
   )
 
   def main(args: Array[String]): Unit = {
-    implicit val ec: ExecutionContext = ExecutionContext.global
     val config = AppConfig.load()
     val channel = ManagedChannelBuilder.forAddress(config.computeHost, config.computePort).usePlaintext().build()
-    val repo = new JdbcDecisionRepository(
-      config.postgresUrl,
-      config.postgresUser,
-      config.postgresPassword,
-      config.postgresPoolSize,
-      config.postgresConnectionTimeoutMs
-    )
-    val cache = new ValkeyDedupeCache(config.valkeyUri)
-    val audit = new KafkaAuditPublisher(config.auditBootstrapServers, config.auditTopic)
-    val workflow = new RequestWorkflow(
-      computeGateway = new GrpcComputeGateway(channel),
-      decisionRepository = repo,
-      dedupeCache = cache,
-      auditPublisher = audit,
-      dedupeTtlSeconds = config.dedupeTtlSeconds
-    )
-
+    val ioExecutor = Executors.newFixedThreadPool(math.max(4, config.postgresPoolSize + 4))
+    implicit val ioEc: ExecutionContext = ExecutionContext.fromExecutorService(ioExecutor)
+    val appEc: ExecutionContext = ExecutionContext.global
     try {
-      val runId = UUID.randomUUID().toString
-      val results = Seq(
-        Await.result(burstMixed(workflow, runId), 10.minutes),
-        Await.result(duplicateReplay(workflow, runId), 10.minutes),
-        Await.result(freshAccept(workflow, runId), 10.minutes),
-        Await.result(staleReject(workflow, runId), 10.minutes)
-      )
+      val repo = new JdbcDecisionRepository(
+        config.postgresUrl,
+        config.postgresUser,
+        config.postgresPassword,
+        config.postgresPoolSize,
+        config.postgresConnectionTimeoutMs
+      )(ioEc)
+      val cache = new ValkeyDedupeCache(config.valkeyUri)(ioEc)
+      val audit = new KafkaAuditPublisher(config.auditBootstrapServers, config.auditTopic)(ioEc)
 
-      println("BENCHMARK_RESULTS_BEGIN")
-      results.foreach(render)
-      println("BENCHMARK_RESULTS_END")
+      val workflow = new RequestWorkflow(
+        computeGateway = new GrpcComputeGateway(channel),
+        decisionRepository = repo,
+        dedupeCache = cache,
+        auditPublisher = audit,
+        dedupeTtlSeconds = config.dedupeTtlSeconds,
+        auditMaxAttempts = config.auditMaxAttempts,
+        auditRetryDelaySeconds = config.auditRetryDelaySeconds
+      )(appEc)
+
+      try {
+        val runId = UUID.randomUUID().toString
+        val results = Seq(
+          Await.result(burstMixed(workflow, runId)(appEc), 10.minutes),
+          Await.result(duplicateReplay(workflow, runId)(appEc), 10.minutes),
+          Await.result(freshAccept(workflow, runId)(appEc), 10.minutes),
+          Await.result(staleReject(workflow, runId)(appEc), 10.minutes)
+        )
+
+        println("BENCHMARK_RESULTS_BEGIN")
+        results.foreach(render)
+        println("BENCHMARK_RESULTS_END")
+      } finally {
+        audit.close()
+        cache.close()
+        repo.close()
+      }
     } finally {
       channel.shutdownNow()
-      audit.close()
-      cache.close()
-      repo.close()
+      ioExecutor.shutdown()
     }
   }
 

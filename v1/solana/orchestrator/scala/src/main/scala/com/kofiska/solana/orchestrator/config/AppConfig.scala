@@ -17,6 +17,8 @@ final case class AppConfig(
   postgresConnectionTimeoutMs: Long,
   valkeyUri: String,
   dedupeTtlSeconds: Long,
+  auditMaxAttempts: Int,
+  auditRetryDelaySeconds: Long,
   auditBootstrapServers: String,
   auditTopic: String
 )
@@ -41,6 +43,8 @@ object AppConfig {
         postgresConnectionTimeoutMs = env("POSTGRES_CONNECTION_TIMEOUT_MS", "5000").toLong,
         valkeyUri = env("VALKEY_URI", "redis://127.0.0.1:6379/0"),
         dedupeTtlSeconds = env("DEDUPE_TTL_SECONDS", "3600").toLong,
+        auditMaxAttempts = env("AUDIT_MAX_ATTEMPTS", "3").toInt,
+        auditRetryDelaySeconds = env("AUDIT_RETRY_DELAY_SECONDS", "30").toLong,
         auditBootstrapServers = env("AUDIT_BOOTSTRAP_SERVERS", "127.0.0.1:9092"),
         auditTopic = env("AUDIT_TOPIC", "solana.audit")
       )
@@ -66,6 +70,8 @@ object AppConfig {
     require(config.postgresConnectionTimeoutMs > 0, "POSTGRES_CONNECTION_TIMEOUT_MS must be positive")
     require(config.valkeyUri.nonEmpty, "VALKEY_URI must not be empty")
     require(config.dedupeTtlSeconds > 0, "DEDUPE_TTL_SECONDS must be positive")
+    require(config.auditMaxAttempts > 0, "AUDIT_MAX_ATTEMPTS must be positive")
+    require(config.auditRetryDelaySeconds > 0, "AUDIT_RETRY_DELAY_SECONDS must be positive")
     require(config.auditBootstrapServers.nonEmpty, "AUDIT_BOOTSTRAP_SERVERS must not be empty")
     require(config.auditTopic.nonEmpty, "AUDIT_TOPIC must not be empty")
     config
