@@ -12,6 +12,8 @@ libraryDependencies ++= Seq(
   "com.typesafe.akka" %% "akka-actor-testkit-typed" % "2.8.5" % Test,
   "com.typesafe.akka" %% "akka-stream" % "2.8.5",
   "com.typesafe.akka" %% "akka-slf4j" % "2.8.5",
+  "com.typesafe.akka" %% "akka-http" % "10.5.3",
+  "com.typesafe.akka" %% "akka-http-spray-json" % "10.5.3",
   "com.zaxxer" % "HikariCP" % "5.1.0",
   "com.thesamet.scalapb" %% "scalapb-runtime" % "0.11.15",
   "com.thesamet.scalapb" %% "scalapb-runtime-grpc" % "0.11.15",
@@ -19,5 +21,6 @@ libraryDependencies ++= Seq(
   "org.postgresql" % "postgresql" % "42.7.4",
   "io.lettuce" % "lettuce-core" % "6.4.0.RELEASE",
   "org.apache.kafka" % "kafka-clients" % "3.8.1",
+  "io.spray" %% "spray-json" % "1.3.6",
   "org.scalatest" %% "scalatest" % "3.2.18" % Test
 )

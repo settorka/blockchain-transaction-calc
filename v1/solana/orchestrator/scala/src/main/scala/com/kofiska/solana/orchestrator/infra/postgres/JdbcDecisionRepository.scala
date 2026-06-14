@@ -1,6 +1,6 @@
 package com.kofiska.solana.orchestrator.infra.postgres
 
-import com.kofiska.solana.orchestrator.domain.{Actionability, DecisionResult, RequestContext, TerminalState, TransitionEvent}
+import com.kofiska.solana.orchestrator.domain.{Actionability, AuditBacklogSnapshot, DecisionResult, OutboxDeliveryResult, PoolSnapshot, RequestContext, TerminalState, TransitionEvent}
 import com.kofiska.solana.orchestrator.ports.DecisionRepository
 import com.zaxxer.hikari.{HikariConfig, HikariDataSource}
 
@@ -150,13 +150,14 @@ final class JdbcDecisionRepository(
   }
 
   private def insertOutbox(conn: Connection, event: TransitionEvent): Unit = {
-    val outboxStatement = conn.prepareStatement(
-      """INSERT INTO audit_outbox (
+          val outboxStatement = conn.prepareStatement(
+            """INSERT INTO audit_outbox (
         |request_id, decision_id, schema_version, trace_id, terminal_state, reason_code, model_version,
-        |route_id, slot, quote_age, source_hashes, stage, latency_ms, bytes_in, bytes_out, success
-        |) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        |route_id, slot, quote_age, source_hashes, stage, latency_ms, bytes_in, bytes_out, success,
+        |status, attempts, last_error, next_retry_at
+        |) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL, NULL)
         |ON CONFLICT (request_id, decision_id) DO NOTHING""".stripMargin
-    )
+          )
     Using.resource(outboxStatement) { ps =>
       ps.setQueryTimeout(5)
       ps.setString(1, event.requestId)
@@ -188,6 +189,8 @@ final class JdbcDecisionRepository(
             |route_id, slot, quote_age, source_hashes, stage, latency_ms, bytes_in, bytes_out, success
             |FROM audit_outbox
             |WHERE published_at IS NULL
+            |  AND status IN ('pending', 'retry')
+            |  AND (next_retry_at IS NULL OR next_retry_at <= NOW())
             |ORDER BY created_at ASC
             |LIMIT ?""".stripMargin
         )
@@ -204,12 +207,56 @@ final class JdbcDecisionRepository(
       }
     })
 
+  override def auditBacklogSnapshot(limit: Int): Future[AuditBacklogSnapshot] =
+    Future(blocking {
+      Using.resource(connection) { conn =>
+        val statement = conn.prepareStatement(
+          """SELECT
+            |  COUNT(*) AS pending_count,
+            |  COALESCE((EXTRACT(EPOCH FROM (NOW() - MIN(created_at))) * 1000)::BIGINT, 0) AS oldest_age_ms
+            |FROM audit_outbox
+            |WHERE published_at IS NULL
+            |  AND status IN ('pending', 'retry')
+            |  AND (next_retry_at IS NULL OR next_retry_at <= NOW())""".stripMargin
+        )
+        Using.resource(statement) { ps =>
+          ps.setQueryTimeout(5)
+          val rows = ps.executeQuery()
+          if (rows.next()) {
+            AuditBacklogSnapshot(
+              pendingCount = rows.getLong("pending_count"),
+              oldestAgeMs = rows.getLong("oldest_age_ms")
+            )
+          } else {
+            AuditBacklogSnapshot(0L, 0L)
+          }
+        }
+      }
+    })
+
+  override def connectionPoolSnapshot(): PoolSnapshot = {
+    val bean = dataSource.getHikariPoolMXBean
+    if (bean == null) {
+      PoolSnapshot(0, 0, 0, 0)
+    } else {
+      PoolSnapshot(
+        active = bean.getActiveConnections,
+        idle = bean.getIdleConnections,
+        total = bean.getTotalConnections,
+        waiting = bean.getThreadsAwaitingConnection
+      )
+    }
+  }
+
   override def markAuditPublished(requestId: String, decisionId: String): Future[Unit] =
     Future(blocking {
       Using.resource(connection) { conn =>
         val statement = conn.prepareStatement(
           """UPDATE audit_outbox
-            |SET published_at = NOW()
+            |SET status = 'sent',
+            |    published_at = NOW(),
+            |    last_error = NULL,
+            |    next_retry_at = NULL
             |WHERE request_id = ? AND decision_id = ?""".stripMargin
         )
         Using.resource(statement) { ps =>
@@ -218,6 +265,51 @@ final class JdbcDecisionRepository(
           ps.setString(2, decisionId)
           ps.executeUpdate()
           ()
+        }
+      }
+    })
+
+  override def markAuditFailed(
+    requestId: String,
+    decisionId: String,
+    reason: String,
+    maxAttempts: Int,
+    retryDelaySeconds: Long
+  ): Future[OutboxDeliveryResult] =
+    Future(blocking {
+      Using.resource(connection) { conn =>
+        val statement = conn.prepareStatement(
+          """UPDATE audit_outbox
+            |SET attempts = attempts + 1,
+            |    last_error = ?,
+            |    status = CASE WHEN attempts + 1 >= ? THEN 'dead' ELSE 'retry' END,
+            |    next_retry_at = CASE WHEN attempts + 1 >= ? THEN NULL ELSE NOW() + (? * INTERVAL '1 second') END,
+            |    published_at = NULL
+            |WHERE request_id = ? AND decision_id = ?""".stripMargin
+        )
+        Using.resource(statement) { ps =>
+          ps.setQueryTimeout(5)
+          ps.setString(1, reason)
+          ps.setInt(2, maxAttempts)
+          ps.setInt(3, maxAttempts)
+          ps.setLong(4, retryDelaySeconds)
+          ps.setString(5, requestId)
+          ps.setString(6, decisionId)
+          ps.executeUpdate()
+        }
+
+        val dispositionStatement = conn.prepareStatement(
+          """SELECT status
+            |FROM audit_outbox
+            |WHERE request_id = ? AND decision_id = ?""".stripMargin
+        )
+        Using.resource(dispositionStatement) { ps =>
+          ps.setQueryTimeout(5)
+          ps.setString(1, requestId)
+          ps.setString(2, decisionId)
+          val rows = ps.executeQuery()
+          if (rows.next() && rows.getString("status") == "dead") OutboxDeliveryResult.DeadLettered
+          else OutboxDeliveryResult.ScheduledRetry
         }
       }
     })

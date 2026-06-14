@@ -41,6 +41,24 @@ Track request lifecycle, economic decisioning, replay, audit, and service health
 - hot cache / dedupe cache
 - audit stream
 
+## Runtime metrics
+
+The orchestrator exposes `/v1/metrics` for runtime state:
+- ingress request count
+- ingress accepted / rejected / overloaded count
+- current in-flight count
+- request latency
+- compute latency
+- terminal counts by state
+- replay hit count
+- replay drift count
+- audit publish failure count
+- audit retry count
+- audit dead-letter count
+- dedupe repair count
+- audit backlog count and oldest age
+- Postgres pool state
+
 ## Required identifiers
 
 Every request, event, span, and log line carries:

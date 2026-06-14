@@ -59,7 +59,7 @@ final class RequestWorkflowSpec extends AsyncFlatSpec with Matchers {
     val repository = new InMemoryDecisionRepository
     val cache = new InMemoryDedupeCache
     val audit = new RecordingAuditPublisher
-    val workflow = new RequestWorkflow(new AcceptGateway, repository, cache, audit, dedupeTtlSeconds = 3600)
+    val workflow = new RequestWorkflow(new AcceptGateway, repository, cache, audit, dedupeTtlSeconds = 3600, auditMaxAttempts = 3, auditRetryDelaySeconds = 30)
 
     workflow.process(context()).map { result =>
       result.terminalState shouldBe TerminalState.Accept
@@ -78,7 +78,7 @@ final class RequestWorkflowSpec extends AsyncFlatSpec with Matchers {
     val repository = new InMemoryDecisionRepository
     val cache = new InMemoryDedupeCache
     val audit = new RecordingAuditPublisher
-    val workflow = new RequestWorkflow(new FailingGateway, repository, cache, audit, dedupeTtlSeconds = 3600)
+    val workflow = new RequestWorkflow(new FailingGateway, repository, cache, audit, dedupeTtlSeconds = 3600, auditMaxAttempts = 3, auditRetryDelaySeconds = 30)
 
     val cached = DecisionResult(
       requestId = "req-1",
@@ -115,7 +115,7 @@ final class RequestWorkflowSpec extends AsyncFlatSpec with Matchers {
     val repository = new InMemoryDecisionRepository
     val cache = new InMemoryDedupeCache
     val audit = new RecordingAuditPublisher
-    val workflow = new RequestWorkflow(new FailingGateway, repository, cache, audit, dedupeTtlSeconds = 3600)
+    val workflow = new RequestWorkflow(new FailingGateway, repository, cache, audit, dedupeTtlSeconds = 3600, auditMaxAttempts = 3, auditRetryDelaySeconds = 30)
 
     cache.state.put("dedupe-1", "decision-1")
 
@@ -133,7 +133,7 @@ final class RequestWorkflowSpec extends AsyncFlatSpec with Matchers {
     val cache = new InMemoryDedupeCache
     val audit = new RecordingAuditPublisher
     val gateway = new CountingGateway
-    val workflow = new RequestWorkflow(gateway, repository, cache, audit, dedupeTtlSeconds = 3600)
+    val workflow = new RequestWorkflow(gateway, repository, cache, audit, dedupeTtlSeconds = 3600, auditMaxAttempts = 3, auditRetryDelaySeconds = 30)
 
     val first = context()
     val second = context().copy(requestId = "req-2")
@@ -153,7 +153,7 @@ final class RequestWorkflowSpec extends AsyncFlatSpec with Matchers {
     val repository = new InMemoryDecisionRepository
     val cache = new InMemoryDedupeCache
     val audit = new RecordingAuditPublisher
-    val workflow = new RequestWorkflow(new MismatchedGateway, repository, cache, audit, dedupeTtlSeconds = 3600)
+    val workflow = new RequestWorkflow(new MismatchedGateway, repository, cache, audit, dedupeTtlSeconds = 3600, auditMaxAttempts = 3, auditRetryDelaySeconds = 30)
 
     workflow.process(context()).map { result =>
       result.terminalState shouldBe TerminalState.Failed
@@ -190,6 +190,8 @@ final class RequestWorkflowSpec extends AsyncFlatSpec with Matchers {
     val dedupe = new ConcurrentHashMap[String, String]()
     val audit = TrieMap.empty[(String, String), TransitionEvent]
     val published = TrieMap.empty[(String, String), Boolean]
+    val attempts = TrieMap.empty[(String, String), Int]
+    val statuses = TrieMap.empty[(String, String), String]
 
     override def find(requestId: String): Future[Option[DecisionResult]] =
       Future.successful(Option(state.get(requestId)))
@@ -207,12 +209,40 @@ final class RequestWorkflowSpec extends AsyncFlatSpec with Matchers {
       }
 
     override def pendingAudit(limit: Int): Future[Vector[TransitionEvent]] =
-      Future.successful(audit.collect { case (key, event) if !published.contains(key) => event }.take(limit).toVector)
+      Future.successful(audit.collect {
+        case (key, event) if !published.contains(key) && statuses.getOrElse(key, "pending") != "dead" => event
+      }.take(limit).toVector)
+
+    override def auditBacklogSnapshot(limit: Int): Future[AuditBacklogSnapshot] =
+      Future.successful(AuditBacklogSnapshot(
+        pendingCount = audit.size.toLong,
+        oldestAgeMs = 0L
+      ))
+
+    override def connectionPoolSnapshot(): PoolSnapshot =
+      PoolSnapshot(0, 0, 0, 0)
 
     override def markAuditPublished(requestId: String, decisionId: String): Future[Unit] =
       Future.successful {
         published.put((requestId, decisionId), true)
+        statuses.put((requestId, decisionId), "sent")
         ()
+      }
+
+    override def markAuditFailed(
+      requestId: String,
+      decisionId: String,
+      reason: String,
+      maxAttempts: Int,
+      retryDelaySeconds: Long
+    ): Future[OutboxDeliveryResult] =
+      Future.successful {
+        val key = (requestId, decisionId)
+        val nextAttempts = attempts.getOrElse(key, 0) + 1
+        attempts.put(key, nextAttempts)
+        val status = if (nextAttempts >= maxAttempts) "dead" else "retry"
+        statuses.put(key, status)
+        if (status == "dead") OutboxDeliveryResult.DeadLettered else OutboxDeliveryResult.ScheduledRetry
       }
   }
 

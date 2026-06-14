@@ -1,67 +1,177 @@
 # v2 Look Ahead
 
-## Goal
+v2 is a Solana swap preflight decision service.
 
-v2 is a live, non-executing Solana swap preflight decision service.
-
-It answers:
+It answers one question:
 
 ```text
-Given a proposed Solana swap, should it be ACCEPTED, DEFERRED, REJECTED, or FAILED_CLOSED?
+Given a proposed Solana swap, should it be ACCEPT, DEFER, REJECT, or FAILED_CLOSED?
 ```
 
-It must use real Solana/market context, but it must not move funds.
+It must use Solana/market context, and it must be unable to move funds.
 
-## Boundaries
+## Plane Model
 
-In scope:
+v2 is a microservice deployment in a GCP VPC.
 
-- Solana RPC read context.
-- Market adapter for quote, route, fee, liquidity, token metadata, and source snapshot.
-- Scala Akka control plane.
-- Rust compute plane over gRPC.
-- Durable decisions, dedupe, replay, audit, observability, Terraform/GCP, runbooks.
+- Entry plane: REST ingress (Scala control plane).
+- Control plane: Scala (Akka) owns lifecycle, policy, dedupe/replay, persistence, outbox, reconciliation, stop-accept.
+- Compute plane: Rust owns numeric compute behind internal gRPC.
+- Data plane: Postgres is the durability boundary; Valkey is a cache acceleration only.
+- Audit plane: Redpanda is downstream distribution; outbox in Postgres is evidence.
 
-Out of scope:
+## Architecture Boundaries
 
-- wallet
-- signer
-- private keys
-- transaction construction
-- transaction submission
-- settlement
-- custody
-- high availability
-- customer-facing SLA
+Planes map to microservices.
 
-v3 is where execution and monetized business maturity can be considered.
+Control plane:
 
-## Architecture
+- `control` (Scala): REST ingress + lifecycle + policy + persistence + outbox + reconciliation.
+
+Compute plane:
+
+- `compute` (Rust): gRPC compute.
+
+Data plane:
+
+- `postgres`: decisions + outbox tables.
+- `valkey`: dedupe cache.
+
+Audit plane:
+
+- `redpanda`: audit stream sink fed by outbox shipper.
+
+Only REST ingress is exposed. Everything else is internal.
 
 ```mermaid
 flowchart TB
-    MARKET["Market Adapter"]
-    RPC["Solana RPC"]
-    CONTROL["Scala Control"]
-    COMPUTE["Rust Compute"]
-    DATA["Data + Audit"]
-    OBS["Observability"]
-    INFRA["Terraform / GCP"]
+    EXT["Caller"] --> REST["REST ingress"]
 
-    RPC --> MARKET
-    MARKET --> CONTROL
-    CONTROL --> COMPUTE
-    COMPUTE --> CONTROL
-    CONTROL --> DATA
-    CONTROL --> OBS
-    COMPUTE --> OBS
-    DATA --> OBS
-    INFRA --> CONTROL
+    subgraph CONTROL["Control plane"]
+        CTRL["control (Scala)"]
+    end
+
+    subgraph COMPUTE["Compute plane"]
+        GRPC["compute (Rust gRPC)"]
+    end
+
+    subgraph DATA["Data plane"]
+        PG["postgres"]
+        VK["valkey"]
+        OB["outbox shipper"]
+    end
+
+    subgraph AUDIT["Audit plane"]
+        RP["redpanda"]
+    end
+
+    REST --> CTRL
+    CTRL --> GRPC
+    GRPC --> CTRL
+    CTRL --> PG
+    CTRL --> VK
+    CTRL --> OB
+    OB --> PG
+    OB --> RP
 ```
 
-## Critical Rule
+## Entry Boundary
 
-`ACCEPT` is allowed only when:
+- v2 MUST expose a REST ingress.
+- Access MUST be gated by a GCP firewall IP allowlist to your PC (no broad public access).
+- The service MUST enforce request authentication and rate/burst limits.
+- Internal Scala->Rust MUST remain gRPC with deadlines and cancellation.
+
+## Out Of Scope
+
+v2 MUST NOT include:
+
+- signer, private keys, custody
+- transaction construction or submission
+- any “forward-to-executor” mode
+
+v3 is where execution and monetized business maturity can be considered.
+
+## Invariants
+
+Request identity and terminalization:
+
+- Every request MUST carry `request_id` and `dedupe_key`.
+- Exactly-once terminalization MUST be enforced by uniqueness (database).
+- Every logical request MUST end in exactly one terminal outcome.
+- Duplicate requests MUST return the recorded terminal decision.
+
+Durability and audit evidence:
+
+- The system MUST persist the terminal decision before acknowledging it.
+- The system MUST write an audit outbox row in the same Postgres transaction as the terminal decision.
+- `ACCEPT` MUST NOT be returned unless the decision+outbox transaction commits.
+- Redpanda availability MUST NOT be a prerequisite for `ACCEPT`.
+- Outbox shipping MUST handle poison rows:
+  - One bad outbox row MUST NOT block shipping of later rows.
+  - Outbox rows MUST have a terminal state (`sent` or `dead`) with an error reason.
+  - Invalid outbox payload generation is a stop-accept condition.
+
+Bounds:
+
+- Ingress MUST enforce numeric limits (request bytes, routes, hops, inflight, queue depth, retries, request lifetime).
+- Rust compute MUST enforce numeric limits (routes, hops, numeric ranges) and MUST run under a deadline.
+- Overload MUST fail closed (`FAILED_CLOSED`).
+
+No execution:
+
+- v2 MUST be unable to execute swaps: no signer, no tx submission path, no keys, no execution libraries.
+- Startup MUST fail if any execution configuration is present.
+- Tests MUST prove there is no execution or execution-adjacent path.
+
+Reconstructible `ACCEPT`:
+
+- For every `ACCEPT`, the system MUST be able to retrieve:
+  - canonical normalized input bytes
+  - canonical source snapshot bytes (or a pointer to stored bytes)
+  - deterministic `source_snapshot_hash` for those bytes
+  - exact policy bundle version (limits + supported lists + gate thresholds)
+  - exact model/config version
+  - exact release/version identifier
+  - gate evaluation trace to justify the decision
+- If any required artifact is missing, ambiguous, or conflict-ridden, `ACCEPT` is illegal.
+
+## Guarantees
+
+The system guarantees the following behaviors when the invariants hold:
+
+- A duplicate request returns the same terminal decision as the first terminalized request for the same `dedupe_key`.
+- A terminal decision has a corresponding outbox row committed in the same Postgres transaction.
+- `ACCEPT` implies:
+  - a committed decision row exists
+  - a committed outbox row exists
+  - referenced evidence exists (input bytes, snapshot bytes or pointer, hashes, versions)
+- Redpanda can be unavailable without permitting an `ACCEPT` that lacks a committed outbox record.
+- One poison outbox row does not prevent later outbox rows from being shipped.
+
+## Source-Of-Truth Policy
+
+The caller MUST NOT be trusted to provide truth.
+
+- The market adapter MUST build a canonical source snapshot from defined providers.
+- Decision throughput MUST be decoupled from provider call rate:
+  - snapshots are polled/cached asynchronously under bounds
+  - per-request RPC/quote fetching is forbidden for go-live
+- Provider conflict MUST be detected and MUST block `ACCEPT`.
+
+Snapshot contents:
+
+- token mints, decimals, and supported-token status
+- amount in integer base units
+- quote/route candidates and provider identity
+- program/venue identity (allowed list applies)
+- fee context, liquidity signal, confidence, timestamp
+- Solana slot and quote age (slot + wall-clock)
+- canonical snapshot bytes + snapshot schema version + snapshot hash
+
+## `ACCEPT` Rule
+
+`ACCEPT` is allowed only when every gate evaluates TRUE under the active policy bundle:
 
 ```text
 EV_lower_bound > operating_cost
@@ -69,116 +179,44 @@ EV_lower_bound > operating_cost
               + slippage_uncertainty
               + source_uncertainty
               + safety_margin
+```
 
-source_snapshot = complete
-freshness_valid = true
-rpc_health = healthy
+And:
+
+```text
+source_snapshot_complete = true
+source_snapshot_fresh = true
+source_snapshot_conflict_free = true
 token_supported = true
-route_supported = true
 program_allowed = true
+route_supported = true
 liquidity_confidence >= minimum
 risk_score <= limit
 exposure <= limit
-model_version = active
+model_version = approved_and_active
 decision_not_expired = true
-persistence = healthy
-audit = healthy
+persistence_writable = true
+outbox_writable = true
+compute_within_budget = true
 ```
 
-If any field is unknown, missing, stale, or untrusted, the result is `DEFER`, `REJECT`, or `FAIL_CLOSED`.
-
-## Technical Minimum
-
-- Akka owns request lifecycle, dedupe, replay, policy, persistence, audit, and reconciliation.
-- Rust owns quote, route, fee, slippage, breakeven, EV, freshness, and risk computation.
-- gRPC is the Scala/Rust boundary with deadlines.
-- Postgres stores durable terminal decisions.
-- Valkey handles hot-path dedupe.
-- Redpanda receives audit events.
-- Every terminal decision has an audit outbox row.
-- Every duplicate logical request replays durable truth.
-- Every queue, mailbox, worker pool, DB pool, gRPC call, retry, and request lifetime has a bound.
-- Overload must become `DEFER`, `REJECT`, or `FAIL_CLOSED`, not hidden backlog.
-
-## Market Adapter Minimum
-
-The market adapter must create the source snapshot. The caller must not be trusted to provide truth.
-
-Required snapshot fields:
-
-- token mints
-- token decimals
-- amount in base units
-- supported-token status
-- quote output
-- route candidates
-- AMM/program identity
-- pool/account context where available
-- fee context
-- liquidity signal
-- Solana slot
-- quote age
-- RPC/provider identity
-- source timestamp
-- source confidence
-- canonical snapshot hash
-
-If the snapshot cannot be built or hashed, `ACCEPT` is illegal.
-
-## Solana Reality Minimum
-
-- Define RPC endpoint policy.
-- Define commitment level.
-- Define max slot lag.
-- Define max quote age.
-- Define supported token list.
-- Define supported program/route list.
-- Reject unknown tokens.
-- Reject unknown programs.
-- Use integer base units for money amounts.
-- Do not use floating point in final money-decision storage.
-- Expire every `ACCEPT` by slot age and wall-clock age.
-
-Devnet/simulation may validate integration. It is not mainnet economic proof.
-
-## No-Execution Proof
-
-v2 must be structurally unable to move funds:
-
-- no signer dependency
-- no private keys
-- no transaction submission code path
-- no `sendTransaction` equivalent
-- startup fails if signer or submit config exists
-- tests prove no execution path exists
+Unknown, missing, or untrusted inputs MUST NOT produce `ACCEPT`.
 
 ## Stop-Accept Conditions
 
-Stop emitting new `ACCEPT` decisions when:
+Stop emitting new `ACCEPT` decisions when any is true:
 
-- Postgres cannot persist decisions.
-- Audit outbox cannot be written.
-- Market adapter cannot build complete snapshots.
-- RPC is stale, lagged, or unhealthy.
-- Dedupe drift appears.
-- Queue age exceeds limit.
-- Rust compute saturates.
-- gRPC deadline failures spike.
-- Source conflict or stale quote rate spikes.
-- Exposure limit is reached.
-- Unknown model, token, program, schema, or release appears.
-- Rollback path is unavailable during deploy.
+- Postgres is not writable (decision/outbox commit fails).
+- Market adapter cannot build fresh, complete, conflict-free snapshots.
+- Rust compute is unavailable or deadline failures breach threshold.
+- Queue age exceeds bound or inflight exceeds bound.
+- Dedupe drift is detected (terminal mismatch between cache and database truth).
+- Exposure accounting cannot be evaluated or is at/over limit.
+- Policy bundle or model/config version is unknown, unapproved, or inconsistent.
 
-## Evidence Per Decision
+## Evidence (Required Fields)
 
-Every terminal decision must be reconstructible from:
-
-- Postgres decision row
-- audit event
-- source snapshot
-- trace/logs/metrics
-
-Required fields:
+Every terminal decision MUST carry (at least):
 
 - `trace_id`
 - `request_id`
@@ -187,7 +225,10 @@ Required fields:
 - `terminal_state`
 - `reason_code`
 - `schema_version`
+- `release_version`
+- `policy_bundle_version`
 - `model_version`
+- `source_snapshot_schema_version`
 - `source_snapshot_hash`
 - `slot`
 - `quote_age`
@@ -204,32 +245,13 @@ Required fields:
 
 ## Go-Live Proof
 
-Do not call v2 live until all are true:
+v2 is not go-live until each is proven end-to-end:
 
-1. Terraform can recreate the GCP instance.
-2. Compose starts the full stack from documented config.
-3. Secrets are not in source control.
-4. Health/readiness checks exist.
-5. Backup and restore are tested.
-6. Rollback is tested.
-7. Audit replay and reconciliation are tested.
-8. Failure injection covers Postgres, Valkey, Redpanda, Rust compute, gRPC timeout, market adapter failure, RPC stale response, partial write, and process restart.
-9. Load test proves `1,000,000 ops/hour` under mixed traffic, hot keys, duplicate storms, stale quotes, oversized routes, dependency latency, and Rust saturation.
-10. Dashboards and alerts exist for latency, queue age, replay drift, audit lag, dependency errors, compute saturation, exposure, and economic decision distribution.
-11. Runbooks exist for deploy/rollback, stop-accept/resume, dependency degradation, source/RPC failure, exposure breach, bad model/config, disk pressure, and restore.
-
-## Definition Of Done
-
-v2 is ready only when it proves:
-
-- real source snapshots
-- bounded request processing
-- replay-safe dedupe
-- durable terminal decisions
-- no execution path
-- positive lower-bound economics for every `ACCEPT`
-- supported token/route/program discipline
-- expiring decisions
-- fail-closed unsafe states
-- reconstructible audit trail
-- tested rollback, restore, failure injection, and load envelope
+1. REST ingress is deployed behind a firewall IP allowlist and enforces auth + bounds + deadlines.
+2. Canonical snapshots exist (bytes + schema + hash) and are referenced by decisions.
+3. Exactly-once terminalization is DB-enforced and duplicate replay returns database truth.
+4. `ACCEPT` implies a committed decision+outbox transaction in Postgres.
+5. Outbox shipping to Redpanda is idempotent; lag is measured; stop-accept threshold exists.
+5a. Outbox shipping handles poison rows (dead-letter exists; poison count is visible; poison does not block shipping).
+6. No-execution proof holds (build/startup/test guards).
+7. Load + failure tests demonstrate behavior at `1,000,000 ops/hour` decision throughput using cached snapshots (not per-request RPC).

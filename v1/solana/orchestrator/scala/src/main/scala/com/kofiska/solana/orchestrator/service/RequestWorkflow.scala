@@ -15,7 +15,10 @@ final class RequestWorkflow(
   decisionRepository: DecisionRepository,
   dedupeCache: DedupeCache,
   auditPublisher: AuditPublisher,
-  dedupeTtlSeconds: Long
+  dedupeTtlSeconds: Long,
+  auditMaxAttempts: Int,
+  auditRetryDelaySeconds: Long,
+  metrics: RuntimeMetrics = RuntimeMetrics.noop
 )(implicit ec: ExecutionContext) {
 
   def process(ctx: RequestContext): Future[DecisionResult] =
@@ -40,13 +43,29 @@ final class RequestWorkflow(
       case false =>
         findDurable(ctx).flatMap {
           case Some(result) =>
+            metrics.recordReplayHit()
             auditPublisher
               .publish(replayEvent(ctx, result))
               .flatMap(_ => decisionRepository.markAuditPublished(result.requestId, result.decisionId))
-              .recover { case _ => () }
-              .map(_ => result)
+              .recoverWith { case error =>
+                metrics.recordAuditPublishFailure()
+                decisionRepository
+                  .markAuditFailed(result.requestId, result.decisionId, auditError(error), auditMaxAttempts, auditRetryDelaySeconds)
+                  .map {
+                    case OutboxDeliveryResult.DeadLettered   => metrics.recordAuditDeadLetter()
+                    case OutboxDeliveryResult.ScheduledRetry => metrics.recordAuditRetryScheduled()
+                  }
+                  .recover { case _ => () }
+              }
+              .map { _ =>
+                metrics.recordTerminalState(result.terminalState)
+                result
+              }
           case None =>
-            Future.successful(duplicateInFlightResult(ctx))
+            metrics.recordReplayDrift()
+            val duplicate = duplicateInFlightResult(ctx)
+            metrics.recordTerminalState(duplicate.terminalState)
+            Future.successful(duplicate)
         }
     }
 
@@ -66,8 +85,19 @@ final class RequestWorkflow(
       _ <- auditPublisher
         .publish(auditEvent)
         .flatMap(_ => decisionRepository.markAuditPublished(durable.requestId, durable.decisionId))
-        .recover { case _ => () }
+        .recoverWith { case error =>
+          metrics.recordAuditPublishFailure()
+          decisionRepository
+            .markAuditFailed(durable.requestId, durable.decisionId, auditError(error), auditMaxAttempts, auditRetryDelaySeconds)
+            .map {
+              case OutboxDeliveryResult.DeadLettered   => metrics.recordAuditDeadLetter()
+              case OutboxDeliveryResult.ScheduledRetry => metrics.recordAuditRetryScheduled()
+            }
+            .recover { case _ => () }
+        }
       _ <- dedupeCache.put(ctx.dedupeKey, durable.decisionId, ttlSeconds = dedupeTtlSeconds).recover { case _ => () }
+      _ = metrics.recordComputeLatencyMs(computeLatencyMs)
+      _ = metrics.recordTerminalState(durable.terminalState)
     } yield durable
   }
 
@@ -246,4 +276,7 @@ final class RequestWorkflow(
 
   private def decimalString(value: Option[BigDecimal]): String =
     value.map(_.bigDecimal.toPlainString).getOrElse("")
+
+  private def auditError(error: Throwable): String =
+    Option(error.getMessage).filter(_.nonEmpty).getOrElse(error.getClass.getSimpleName)
 }
