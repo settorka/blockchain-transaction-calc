@@ -1,6 +1,6 @@
 package com.kofiska.solana.orchestrator.infra.inmemory
 
-import com.kofiska.solana.orchestrator.domain.{DecisionResult, OutboxDeliveryResult, RequestContext, TransitionEvent}
+import com.kofiska.solana.orchestrator.domain.{AuditBacklogSnapshot, DecisionResult, OutboxDeliveryResult, PoolSnapshot, RequestContext, TransitionEvent}
 import com.kofiska.solana.orchestrator.ports.DecisionRepository
 
 import scala.collection.concurrent.TrieMap
@@ -33,6 +33,21 @@ final class InMemoryDecisionRepository(implicit ec: ExecutionContext) extends De
             if !published.contains((requestId, decisionId)) && row.status != "dead" && row.nextRetryAt.forall(_ <= System.currentTimeMillis()) => row.event
       }.take(limit).toVector
     }
+
+  override def auditBacklogSnapshot(limit: Int): Future[AuditBacklogSnapshot] =
+    Future.successful {
+      val now = System.currentTimeMillis()
+      val rows = auditRows.collect {
+        case (_, row) if row.status != "dead" && row.nextRetryAt.forall(_ <= now) => row
+      }.toVector
+      AuditBacklogSnapshot(
+        pendingCount = rows.size.toLong,
+        oldestAgeMs = 0L
+      )
+    }
+
+  override def connectionPoolSnapshot(): PoolSnapshot =
+    PoolSnapshot(0, 0, 0, 0)
 
   override def markAuditPublished(requestId: String, decisionId: String): Future[Unit] =
     Future.successful {

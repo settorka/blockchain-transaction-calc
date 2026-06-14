@@ -8,7 +8,7 @@ import com.kofiska.solana.orchestrator.infra.grpc.GrpcComputeGateway
 import com.kofiska.solana.orchestrator.infra.postgres.JdbcDecisionRepository
 import com.kofiska.solana.orchestrator.infra.redpanda.KafkaAuditPublisher
 import com.kofiska.solana.orchestrator.infra.valkey.ValkeyDedupeCache
-import com.kofiska.solana.orchestrator.service.{ReconciliationService, RequestWorkflow}
+import com.kofiska.solana.orchestrator.service.{ReconciliationService, RequestWorkflow, RuntimeMetrics}
 
 import io.grpc.ManagedChannelBuilder
 
@@ -39,6 +39,7 @@ object OrchestratorMain {
       )(ioEc)
       val dedupeCache = new ValkeyDedupeCache(config.valkeyUri)(ioEc)
       val auditPublisher = new KafkaAuditPublisher(config.auditBootstrapServers, config.auditTopic)(ioEc)
+      val metrics = RuntimeMetrics.live()
 
       val workflow = new RequestWorkflow(
         computeGateway = new GrpcComputeGateway(channel),
@@ -47,7 +48,8 @@ object OrchestratorMain {
         auditPublisher = auditPublisher,
         dedupeTtlSeconds = config.dedupeTtlSeconds,
         auditMaxAttempts = config.auditMaxAttempts,
-        auditRetryDelaySeconds = config.auditRetryDelaySeconds
+        auditRetryDelaySeconds = config.auditRetryDelaySeconds,
+        metrics = metrics
       )(appEc)
       val reconciliationService = new ReconciliationService(
         decisionRepository = decisionRepository,
@@ -55,12 +57,13 @@ object OrchestratorMain {
         auditPublisher = auditPublisher,
         dedupeTtlSeconds = config.dedupeTtlSeconds,
         auditMaxAttempts = config.auditMaxAttempts,
-        auditRetryDelaySeconds = config.auditRetryDelaySeconds
+        auditRetryDelaySeconds = config.auditRetryDelaySeconds,
+        metrics = metrics
       )(appEc)
 
       val system = ActorSystem(Behaviors.empty[Unit], "solana-orchestrator")
       val binding = Await.result(
-        IngressHttpServer.start(system.toClassic, workflow, config)(appEc),
+        IngressHttpServer.start(system.toClassic, workflow, decisionRepository, config, metrics)(appEc),
         30.seconds
       )
       system.log.info("orchestrator started")

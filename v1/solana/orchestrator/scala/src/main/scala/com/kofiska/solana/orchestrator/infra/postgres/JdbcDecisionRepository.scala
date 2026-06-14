@@ -1,6 +1,6 @@
 package com.kofiska.solana.orchestrator.infra.postgres
 
-import com.kofiska.solana.orchestrator.domain.{Actionability, DecisionResult, OutboxDeliveryResult, RequestContext, TerminalState, TransitionEvent}
+import com.kofiska.solana.orchestrator.domain.{Actionability, AuditBacklogSnapshot, DecisionResult, OutboxDeliveryResult, PoolSnapshot, RequestContext, TerminalState, TransitionEvent}
 import com.kofiska.solana.orchestrator.ports.DecisionRepository
 import com.zaxxer.hikari.{HikariConfig, HikariDataSource}
 
@@ -206,6 +206,47 @@ final class JdbcDecisionRepository(
         }
       }
     })
+
+  override def auditBacklogSnapshot(limit: Int): Future[AuditBacklogSnapshot] =
+    Future(blocking {
+      Using.resource(connection) { conn =>
+        val statement = conn.prepareStatement(
+          """SELECT
+            |  COUNT(*) AS pending_count,
+            |  COALESCE((EXTRACT(EPOCH FROM (NOW() - MIN(created_at))) * 1000)::BIGINT, 0) AS oldest_age_ms
+            |FROM audit_outbox
+            |WHERE published_at IS NULL
+            |  AND status IN ('pending', 'retry')
+            |  AND (next_retry_at IS NULL OR next_retry_at <= NOW())""".stripMargin
+        )
+        Using.resource(statement) { ps =>
+          ps.setQueryTimeout(5)
+          val rows = ps.executeQuery()
+          if (rows.next()) {
+            AuditBacklogSnapshot(
+              pendingCount = rows.getLong("pending_count"),
+              oldestAgeMs = rows.getLong("oldest_age_ms")
+            )
+          } else {
+            AuditBacklogSnapshot(0L, 0L)
+          }
+        }
+      }
+    })
+
+  override def connectionPoolSnapshot(): PoolSnapshot = {
+    val bean = dataSource.getHikariPoolMXBean
+    if (bean == null) {
+      PoolSnapshot(0, 0, 0, 0)
+    } else {
+      PoolSnapshot(
+        active = bean.getActiveConnections,
+        idle = bean.getIdleConnections,
+        total = bean.getTotalConnections,
+        waiting = bean.getThreadsAwaitingConnection
+      )
+    }
+  }
 
   override def markAuditPublished(requestId: String, decisionId: String): Future[Unit] =
     Future(blocking {

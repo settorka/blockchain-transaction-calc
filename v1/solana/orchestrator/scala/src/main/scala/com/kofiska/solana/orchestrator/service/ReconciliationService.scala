@@ -11,7 +11,8 @@ final class ReconciliationService(
   auditPublisher: AuditPublisher,
   dedupeTtlSeconds: Long,
   auditMaxAttempts: Int,
-  auditRetryDelaySeconds: Long
+  auditRetryDelaySeconds: Long,
+  metrics: RuntimeMetrics = RuntimeMetrics.noop
 )(implicit ec: ExecutionContext) {
 
   def runOnce(limit: Int): Future[ReconciliationReport] =
@@ -36,11 +37,16 @@ final class ReconciliationService(
         auditPublisher.publish(event).flatMap { _ =>
           decisionRepository.markAuditPublished(event.requestId, event.decisionId).map(_ => (published + 1, failed, dead, retry))
         }.recoverWith { case error =>
+          metrics.recordAuditPublishFailure()
           decisionRepository
             .markAuditFailed(event.requestId, event.decisionId, auditError(error), auditMaxAttempts, auditRetryDelaySeconds)
             .map {
-              case OutboxDeliveryResult.DeadLettered   => (published, failed + 1, dead + 1, retry)
-              case OutboxDeliveryResult.ScheduledRetry => (published, failed + 1, dead, retry + 1)
+              case OutboxDeliveryResult.DeadLettered =>
+                metrics.recordAuditDeadLetter()
+                (published, failed + 1, dead + 1, retry)
+              case OutboxDeliveryResult.ScheduledRetry =>
+                metrics.recordAuditRetryScheduled()
+                (published, failed + 1, dead, retry + 1)
             }
             .recover { case _ => (published, failed + 1, dead, retry) }
         }
@@ -55,6 +61,7 @@ final class ReconciliationService(
           val dedupeKey = key.stripPrefix("solana:dedupe:")
           decisionRepository.findByDedupeKey(dedupeKey).flatMap {
             case Some(result) =>
+              metrics.recordDedupeRepair()
               dedupeCache.put(dedupeKey, result.decisionId, dedupeTtlSeconds).map(_ => count + 1)
             case None =>
               dedupeCache.delete(dedupeKey).map(_ => count)

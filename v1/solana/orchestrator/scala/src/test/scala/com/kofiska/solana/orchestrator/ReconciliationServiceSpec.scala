@@ -46,6 +46,15 @@ final class ReconciliationServiceSpec extends AsyncFlatSpec with Matchers {
     override def pendingAudit(limit: Int): Future[Vector[TransitionEvent]] =
       Future.successful(pending.filter(event => statuses.getOrElse(event.requestId, "dead") != "dead").take(limit))
 
+    override def auditBacklogSnapshot(limit: Int): Future[AuditBacklogSnapshot] =
+      Future.successful(AuditBacklogSnapshot(
+        pendingCount = pending.size.toLong,
+        oldestAgeMs = 0L
+      ))
+
+    override def connectionPoolSnapshot(): PoolSnapshot =
+      PoolSnapshot(0, 0, 0, 0)
+
     override def markAuditPublished(requestId: String, decisionId: String): Future[Unit] =
       Future.successful(statuses.update(requestId, "sent"))
 

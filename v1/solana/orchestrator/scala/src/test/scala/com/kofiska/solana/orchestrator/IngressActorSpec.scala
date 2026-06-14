@@ -121,6 +121,15 @@ final class IngressActorSpec extends ScalaTestWithActorTestKit with AnyWordSpecL
         case (key, event) if !published.contains(key) && statuses.getOrElse(key, "pending") != "dead" => event
       }.take(limit).toVector)
 
+    override def auditBacklogSnapshot(limit: Int): Future[AuditBacklogSnapshot] =
+      Future.successful(AuditBacklogSnapshot(
+        pendingCount = audit.size.toLong,
+        oldestAgeMs = 0L
+      ))
+
+    override def connectionPoolSnapshot(): PoolSnapshot =
+      PoolSnapshot(0, 0, 0, 0)
+
     override def markAuditPublished(requestId: String, decisionId: String): Future[Unit] =
       Future.successful {
         published.put((requestId, decisionId), true)

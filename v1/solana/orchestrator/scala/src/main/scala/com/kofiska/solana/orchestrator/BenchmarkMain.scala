@@ -6,7 +6,7 @@ import com.kofiska.solana.orchestrator.infra.postgres.JdbcDecisionRepository
 import com.kofiska.solana.orchestrator.infra.redpanda.KafkaAuditPublisher
 import com.kofiska.solana.orchestrator.infra.valkey.ValkeyDedupeCache
 import com.kofiska.solana.orchestrator.domain._
-import com.kofiska.solana.orchestrator.service.RequestWorkflow
+import com.kofiska.solana.orchestrator.service.{RequestWorkflow, RuntimeMetrics}
 
 import io.grpc.ManagedChannelBuilder
 
@@ -44,6 +44,7 @@ object BenchmarkMain {
       )(ioEc)
       val cache = new ValkeyDedupeCache(config.valkeyUri)(ioEc)
       val audit = new KafkaAuditPublisher(config.auditBootstrapServers, config.auditTopic)(ioEc)
+      val metrics = RuntimeMetrics.live()
 
       val workflow = new RequestWorkflow(
         computeGateway = new GrpcComputeGateway(channel),
@@ -52,7 +53,8 @@ object BenchmarkMain {
         auditPublisher = audit,
         dedupeTtlSeconds = config.dedupeTtlSeconds,
         auditMaxAttempts = config.auditMaxAttempts,
-        auditRetryDelaySeconds = config.auditRetryDelaySeconds
+        auditRetryDelaySeconds = config.auditRetryDelaySeconds,
+        metrics = metrics
       )(appEc)
 
       try {
