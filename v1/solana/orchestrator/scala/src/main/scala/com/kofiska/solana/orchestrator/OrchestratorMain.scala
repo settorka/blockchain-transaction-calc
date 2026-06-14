@@ -1,8 +1,9 @@
 package com.kofiska.solana.orchestrator
 
 import akka.actor.typed.ActorSystem
-import com.kofiska.solana.orchestrator.actors.IngressActor
+import akka.actor.typed.scaladsl.Behaviors
 import com.kofiska.solana.orchestrator.config.AppConfig
+import com.kofiska.solana.orchestrator.infra.http.IngressHttpServer
 import com.kofiska.solana.orchestrator.infra.grpc.GrpcComputeGateway
 import com.kofiska.solana.orchestrator.infra.postgres.JdbcDecisionRepository
 import com.kofiska.solana.orchestrator.infra.redpanda.KafkaAuditPublisher
@@ -14,6 +15,7 @@ import io.grpc.ManagedChannelBuilder
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Await
 import scala.concurrent.duration._
+import akka.actor.typed.scaladsl.adapter._
 
 object OrchestratorMain {
   def main(args: Array[String]): Unit = {
@@ -47,8 +49,13 @@ object OrchestratorMain {
       dedupeTtlSeconds = config.dedupeTtlSeconds
     )
 
-    val system = ActorSystem(IngressActor(workflow), "solana-orchestrator")
+    val system = ActorSystem(Behaviors.empty[Unit], "solana-orchestrator")
+    val binding = Await.result(
+      IngressHttpServer.start(system.toClassic, workflow, config),
+      30.seconds
+    )
     system.log.info("orchestrator started")
+    system.log.info("http ingress bound at {}:{}", config.httpHost, Int.box(config.httpPort))
     reconciliationService.runOnce(100)
     val reconciliationTask = system.scheduler.scheduleAtFixedRate(5.minutes, 5.minutes)(
       new Runnable {
@@ -59,6 +66,7 @@ object OrchestratorMain {
 
     sys.addShutdownHook {
       reconciliationTask.cancel()
+      Await.result(binding.unbind(), 10.seconds)
       channel.shutdownNow()
       auditPublisher.close()
       dedupeCache.close()

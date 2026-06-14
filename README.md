@@ -156,7 +156,7 @@ Target posture: correctness under controlled load.
 
 Notes:
 
-- v1 does not expose a remote REST/HTTP boundary yet. Ingress is internal (Akka actor messages / benchmarks).
+- v1 exposes a REST ingress for external callers.
 - gRPC in v1 is the Scala->Rust compute boundary.
 
 Request shape:
